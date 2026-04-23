@@ -60,24 +60,51 @@ python src/train/train_rankft_function.py \
 
 ## Data
 
-Training + eval data released separately (too large for git).
+All sources are public. Derived artifacts (BM25 pools, PathSwap variants, per-commit Verified index, function-level corpus) regenerate via our scripts in ~1-2 h.
 
-**HuggingFace:** `huggingface.co/datasets/AOoligei/codegrip` *(pending upload)*
+### 1. Base datasets
 
-Expected layout after download:
+**SWE-bench Lite / Verified / train** (public, via HuggingFace):
+```python
+from datasets import load_dataset
+load_dataset("princeton-nlp/SWE-bench_Lite",      split="test")   # 300
+load_dataset("princeton-nlp/SWE-bench_Verified",  split="test")   # 500
+load_dataset("princeton-nlp/SWE-bench",           split="train")  # for training pairs
 ```
-data/rankft/
-  clean_swe_train.jsonl             1870 SWE-bench-train pairs
-  clean_train_combined_v2.jsonl     5916 SWE + GREPO combined (Run 2)
-data/swebench_lite/
-  swebench_lite_test.jsonl          300 Lite instances
-  swebench_lite_test_pathswap.jsonl SHA-256 perturbed variant
-  swebench_bm25_final_top500.jsonl  BM25 candidate pool
-  pathswap_alias_map.json           original -> hashed path map
-data/swebench_verified/
-  swebench_verified_test.jsonl      500 Verified
-  swebench_bm25_strict.jsonl        per-commit BM25 (85% Acc@100)
+
+**GREPO** (public, PKU MuLab): https://github.com/qingpingmo/GREPO  
+Dataset on ModelScope: https://modelscope.cn/datasets/qingpingmomo/Grepo  
+We use the train split (7883 issues) from `data/grepo_text/grepo_train.jsonl` in their release.
+
+**Source repositories** (75 repos for GREPO + 12 for SWE-bench): `git clone` from GitHub per the repo list in `data/repos/.manifest.txt` (regenerated below).
+
+### 2. Derived artifacts (regenerate from scripts)
+
+```bash
+# 1. BM25 top-500 candidates for SWE-bench train (used by Run 1/2 training)
+python scripts/build_swebench_bm25.py --split train --top_k 500
+# 2. BM25 top-500 for SWE-bench Lite / Verified test
+python scripts/build_swebench_bm25.py --split test --benchmark lite
+python scripts/build_swebench_verified_bm25_strict.py  # per-commit, Acc@100 = 85%
+# 3. SHA-256 PathSwap test variants
+python scripts/build_swebench_pathswap.py --benchmark lite
+python scripts/build_swebench_verified_pathswap.py
+# 4. Combined training pool (SWE + GREPO, 5916 pairs)
+python scripts/build_clean_train_combined.py \
+  --swe_train data/rankft/clean_swe_train.jsonl \
+  --grepo_train data/grepo_text/grepo_train.jsonl \
+  --out data/rankft/clean_train_combined_v2.jsonl
+# 5. Function-level GT + corpus + train pairs (for function-level LoRA)
+python scripts/build_func_gt_swe.py
+python scripts/build_func_gt_grepo.py
+python scripts/build_func_corpus_per_commit.py --num_workers 8
+python scripts/codegrip_func_mine_hard_negatives.py \
+  --gt_files data/func_gt/func_gt_swe.jsonl data/func_gt/func_gt_grepo.jsonl \
+  --corpus_dir data/func_corpus --output data/func_gt/train_pairs.jsonl \
+  --drop_log data/func_gt/drop.log
 ```
+
+All scripts use `seed=42` and are deterministic.
 
 ## Headline numbers
 
