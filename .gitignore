@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Data + experiments (released separately via HF)
+data/
+experiments/
+logs/
+*.log
+
+# Build artifacts
+*.aux
+*.bbl
+*.blg
+*.out
+*.pdf
+*.synctex.gz
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Env
+.env
+.venv/
+venv/
+
+# Local/temp
+.cache/
+.claude/
+*.tar.gz
+tmp/
+scratch/

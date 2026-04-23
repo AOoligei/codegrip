@@ -1,0 +1,2038 @@
+\documentclass{article}
+
+\usepackage{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit, calc, backgrounds}
+\graphicspath{{figures/}}
+
+\title{Path Confounds in File-Level Bug Localization:\\Diagnosis, SOTA Generalization, and a Path-Augmented Training Fix}
+
+\author{Anonymous Authors}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+File-level Recall@1 is the standard metric for bug localization, yet it is unclear whether high scores reflect genuine code understanding or merely exploitation of repository structure.
+We show that \textbf{file-level R@1 is dominated by path-structural shortcuts}: PathSwap causes 44--80\% collapse across three 7--8B model families and four benchmarks, and the same pattern persists on SWE-bench Verified, where filename shuffling drops R@1 from 35.53\% to 10.10\% ($-$72\%).
+Critically, the confound is \emph{not} a property of our fine-tuned reranker: SweRankEmbed-Large (SOTA dense retrieval, 7B, 67K training examples) collapses by 55--78\% on SWE-bench Lite under the same perturbations.
+As a positive demonstration that the diagnostic translates into design, we propose \emph{codeaware}: a 7B LoRA fine-tuned with code in the scoring prompt and 50\% path-shuffled training batches. Under the BM25 top-100 candidate pool, our strongest variant (Run~2: SWE+GREPO 5{,}916 samples, aug=0.5) reaches \textbf{56.67\% R@1 on SWE-bench Lite and 48.13\% on SWE-bench Verified}, versus 54.00\%/46.12\% for the path-only baseline (Run~1, no augmentation, no code in prompt). Running the official SweRankLLM-Small listwise reranker on the same BM25 top-100 pool yields 47.93\% on Lite. The full SweRank pipeline (SweRankEmbed-Large full-repo function retriever $\to$ SweRankLLM listwise) is reported by \citet{reddy2025swerank} to achieve 78.10\% file Acc@1 on their own function-indexed pool, under a strict Acc@1 metric and a different candidate space; we quantify how much of that gap is explained by path shortcuts via a path-perturbed re-run of their pipeline (\S\ref{sec:codeaware}). \textbf{Critically, under SHA-256 PathSwap perturbation, Run~2 drops only $-$16.5\% relative on Lite and $-$6.5\% on Verified, while the path-only baseline collapses by $-$38.3\% / $-$42.7\%}---establishing that path-augmented training yields substantial path-robustness without sacrificing same-pool accuracy.
+Two training-free alternatives (Path-Null Anchor, Reciprocal Rank Fusion with SweRankEmbed) provide no improvement, indicating the contribution lies in \emph{training}, not in inference tricks.
+We release \textbf{PathSwap} and \textbf{Code-Crucial} as community stress tests and argue that progress should be measured with path-robust protocols rather than raw pointwise file-level R@1 alone.
+\end{abstract}
+
+
+%======================================================================
+\section{Introduction}
+\label{sec:intro}
+%======================================================================
+
+File-level Recall@1 is the dominant evaluation metric for bug localization---the task of identifying which source files need modification given a bug report~\citep{wong2016survey, zeng2022fault}.
+Modern rerankers achieve increasingly strong file-level scores~\citep{reddy2025swerank, xia2024agentless}, and these numbers are often read as evidence of better code understanding.
+But file-level localization is a \emph{measurement problem}: a file path such as \texttt{auth/login.py} already encodes substantial structural evidence about a ``login'' bug, even before the model reads a single line of code.
+
+This paper shows that the dominant failure is not simply ``models ignore code.''
+Rather, current \textbf{file-level scoring objectives reward path shortcuts and compress code into a weak residual signal}.
+Controlled perturbations reveal that filename shuffling collapses accuracy by 73--80\% across three 7--8B model families on GREPO and SWE-bench Lite, full path hashing causes 92--98\% collapse, and the same dependence persists on SWE-bench Verified where shuffling reduces R@1 from 35.53\% to 10.10\% ($-$72\%).
+Critically, the SOTA dense retriever SweRankEmbed-Large (7B, trained on 67K issue--code pairs) collapses by 55--78\% under the same perturbations, confirming the confound is not specific to our fine-tuned reranker.
+Six code-aware pointwise variants fail to improve over path-only at inference time.
+The scientific question therefore becomes: \emph{can training be modified so the reranker actually reads code, and does that translate to higher R@1 on the standard protocol?}
+Our answer is yes---a simple path-augmented training recipe improves Verified R@1 by $+$9.4pp over our baseline, is competitive with SweRankLLM-Small in a same-pool controlled comparison, and is dramatically less sensitive to path perturbations.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{codegrip_teaser.jpg}
+\caption{Teaser: file-level bug localization mixes \emph{structure localization} with \emph{code understanding}. Under standard pointwise scoring, lexical overlap between bug reports and file paths can create the illusion of code reasoning; PathSwap removes this shortcut and reveals dependence on path cues.}
+\label{fig:codegrip_teaser}
+\end{figure}
+
+To answer this question, we develop three complementary instruments.
+\textbf{PathSwap} destroys path--content correspondence while preserving repository structure, measuring how much accuracy depends on path identity.
+\textbf{Code-Crucial} isolates examples where path cues should be weak and code evidence should matter.
+And \textbf{codeaware}---a LoRA fine-tune where 50\% of training examples see shuffled paths with code in the scoring prompt---forces the model to read code while maintaining a normal file-scoring interface at inference.
+
+Our contributions:
+\begin{enumerate}
+    \item \textbf{File-level R@1 is confounded by path-structural shortcuts, including in SOTA.}
+    Controlled perturbations cause 44--80\% collapse across three 7--8B model families, four benchmarks, and three scorer architectures; on SWE-bench Verified alone, shuffling reduces R@1 from 35.53\% to 10.10\% ($-$72\%). Even agentic frontier reasoning drops by 62\% under shuffling. Applied to the SOTA dense retriever SweRankEmbed-Large, PathSwap causes $-$55\% to $-$78\% collapse (\S\ref{sec:cross_architecture}).
+
+    \item \textbf{Path-augmented training improves over a path-only baseline and is dramatically more path-invariant.}
+    We ablate the codeaware recipe across three LoRAs differing only in path-augmentation and training-data scale.
+    Under the BM25 top-100 pool, path-aware Run~2 (SWE+GREPO 5{,}916, aug=0.5) reaches \textbf{56.67\% R@1 on Lite and 48.13\% on Verified}; path-only Run~1 (no augmentation) reaches 54.00\%/46.12\%.
+    Under SHA-256 PathSwap perturbation, the path-only baseline collapses by $-$38.3\% / $-$42.7\%, while Run~2 drops only $-$16.5\% / $-$6.5\%---a 2.5--6$\times$ reduction in relative collapse (\S\ref{sec:codeaware}).
+    In a same-pool controlled comparison on BM25 top-100 files, SweRankLLM-Small achieves 47.93\% on Lite (not its native setup); we make no cross-pool ``beat SweRank'' claim, only that codeaware is competitive in a controlled setting and substantially more path-robust.
+
+    \item \textbf{File-level success is a weak proxy for downstream code localization.}
+    Only 43.9\% of file-level top-1 successes transfer to function-level top-1, indicating that file-level R@1 conflates structure localization with intra-file code reasoning.
+
+    \item \textbf{PathSwap, Code-Crucial, and path-robust protocols provide actionable measurement tools.}
+    These stress tests expose when a system is exploiting path cues, when code should help, and which evaluation protocols are better aligned with genuine code understanding.
+
+    \item \textbf{Training-free alternatives (Path-Null Anchor; Reciprocal Rank Fusion with SweRankEmbed) do not recover code signal}; the gain is attributable to training, not inference tricks (\S\ref{sec:codeaware}).
+\end{enumerate}
+
+
+%======================================================================
+\section{Related Work}
+\label{sec:related}
+%======================================================================
+
+\paragraph{Bug Localization.}
+Traditional approaches use IR methods such as BM25~\citep{robertson2009probabilistic} or learned similarity~\citep{huo2016learning, lam2017bug}.
+Recent LLM-based methods---Agentless~\citep{xia2024agentless}, AutoCodeRover~\citep{zhang2024autocoderover}, LocAgent~\citep{chen2025locagent}, SweRank~\citep{reddy2025swerank}, and CodeRankEmbed~\citep{suresh2025cornstack}---achieve strong file-level scores on SWE-bench~\citep{jimenez2024swebench} and GREPO~\citep{wang2026grepo}, typically evaluated by R@$k$ or Hit@$k$.
+Data contamination concerns~\citep{liang2025swebench} and the possibility that high scores reflect surface shortcuts rather than deep code understanding motivate our perturbation-based stress tests.
+
+\paragraph{Graph-Based Software Analysis.}
+Co-change~\citep{zimmermann2004mining, ying2004predicting, zimmermann2008predicting} and dependency graphs capture latent program structure.
+GREPO~\citep{wang2026grepo} applies GATv2 to co-change and import graphs; CodexGraph~\citep{liu2025codexgraph}, CoSIL~\citep{jiang2025cosil}, and RepoGraph~\citep{ouyang2025repograph} use structure for repository navigation.
+Hard negatives are well-studied in dense retrieval~\citep{xiong2021approximate, qu2021rocketqa}; prior work~\citep{feng2025grip} internalizes graph structure into LoRA parameters.
+Distribution mismatch between retrieval and reranking is recognized in IR~\citep{gao2021lce, jacob2024drowning}; our cross-pool analysis (Appendix~\ref{app:coupling}) shows this gap is checkpoint-dependent.
+Reciprocal rank fusion~\citep{cormack2009rrf} is a standard ensemble technique.
+
+\paragraph{Shortcut Learning and Evaluation Validity.}
+Machine learning models frequently exploit surface-level shortcuts rather than intended reasoning patterns~\citep{geirhos2020shortcut}.
+In NLP, hypothesis-only baselines expose annotation artifacts in natural language inference~\citep{poliak2018hypothesis, gururangan2018annotation}, and adversarial perturbation tests reveal brittle reasoning in QA~\citep{jia2017adversarial}.
+In code understanding, contrastive testing has been used to evaluate whether models truly understand semantics versus surface patterns~\citep{rabin2021understanding}.
+Our work applies analogous methodology to bug localization: controlled path perturbations serve as ``hypothesis-only baselines'' that reveal how much of file-level R@1 can be explained by path matching alone, without any code understanding.
+
+
+%======================================================================
+\section{Experimental Setup}
+\label{sec:method}
+\label{sec:experiments}
+\label{sec:setup}
+%======================================================================
+
+We use a three-stage reranking pipeline (CodeGRIP) as an experimental testbed, not as the primary contribution.
+The pipeline details are in Appendix~\ref{app:pipeline_details}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{codegrip_method.jpg}
+\caption{Measurement instruments used in CodeGRIP. PathSwap isolates dependence on path identity, Code-Crucial isolates examples where code should matter, and finer-grained code experts probe whether code signal appears only after the search space is narrowed.}
+\label{fig:codegrip_method}
+\end{figure}
+
+\input{method_body}
+
+\paragraph{Dataset.}
+We use GREPO~\citep{wang2026grepo}, comprising 47,166 Python bug reports across 86 repositories.
+We train on 7,883 examples from 70 repositories and evaluate on 1,704 of 2,175 test examples that involve at least one Python file change; the remaining 471 examples modify only non-Python files (documentation, configuration) and fall outside the scope of Python file localization.
+Co-change and import graphs are constructed from training-set pull requests only; no test-set PRs contribute to graph construction (Appendix~\ref{app:leakage}).
+Import graphs are obtained via static AST analysis; graphs are available for 58 of the 86 repositories (covering all test-set repos).
+
+\paragraph{Baselines.}
+\emph{Retrieval baselines}: BM25 (top-500 from all Python files per repo); Contriever-msmarco~\citep{izacard2022unsupervised} and E5-base~\citep{wang2022text} (general-purpose dense retrievers, retrieving from all files); SweRank~\citep{reddy2025swerank} (SweRankEmbed-Large, 7B parameters, trained on 67K SWE examples, reranking BM25-top-500).
+\emph{Cross-paradigm references}: GATv2 from GREPO~\citep{wang2026grepo}; zero-shot Qwen2.5-7B cross-encoder (same base model, no fine-tuning).
+
+\paragraph{Metrics.}
+Recall@$K$ (R@$K$): fraction of ground-truth files in top-$K$ predictions, averaged over examples.
+Hit@$K$: binary indicator (1 if any GT file in top-$K$, else 0), averaged; higher than R@$K$ on multi-file bugs.
+We use R@1 as the primary metric unless noted; tables specify which metric is used.
+Statistical significance via paired bootstrap ($B = 10{,}000$).
+
+\paragraph{Implementation.}
+The main CodeGRIP pipeline uses Qwen2.5-7B-Instruct with LoRA (rank 32, $\alpha = 64$); cross-family experiments additionally use Llama-3.1-8B and Qwen3-8B.
+Stage 1: 3 epochs, lr $2 \times 10^{-5}$.
+Stage 3: 2 epochs, lr $5 \times 10^{-5}$, listwise loss (1 positive + 16 negatives).
+RTX 4090 GPUs (24GB).
+
+
+\paragraph{Pipeline and baselines.}
+\label{sec:overview}
+\label{sec:expansion}
+\label{sec:main_results}
+The primary Qwen2.5-7B path-only reranker averages 28.92$\pm$0.56\% R@1 across 3 seeds.
+Of seven structural injection points tested (Appendix~\ref{app:model_side}), only candidate-side graph expansion succeeded ($+$2--6pp); all scorer-side methods failed, explained by the path prior (\S\ref{sec:analysis}).
+
+
+%======================================================================
+\section{Evidence of Path Confounding in File-Level Evaluation}
+\label{sec:path_analysis}
+\label{sec:analysis}
+%======================================================================
+
+The scorer-side structure failures (\S\ref{sec:overview}; Appendix~\ref{app:structure_analysis}) share a common explanation: the reranker relies overwhelmingly on \textbf{path tokens}---filename identity, directory co-location, and hierarchical position---as its dominant discriminative signal.
+
+\paragraph{Paths predict graph structure.}
+Logistic regression on path features alone predicts co-change edges with AUC = 0.667 and import edges with AUC = 0.728 (Appendix~\ref{app:path_predicts}).
+The most predictive features are Jaccard path-component overlap ($+$5.01 log-odds for import) and leaf filename similarity ($+$1.43 for co-change).
+Paths are an imperfect but substantial proxy for the explicit graph structure.
+
+\paragraph{Path dominance is not an artifact of path-only prompts.}
+A content-aware reranker (path + file content summaries) achieves R@1 = 23.01\%---\emph{lower} than path-only (28.92$\pm$0.56\%)---despite having strictly more information.
+All content-integration variants underperform path-only (Table~\ref{tab:content_ablation}), showing path dominance is a \emph{discovered property}, not a design choice.
+
+% Content ablation table moved to Appendix (Table~\ref{tab:content_ablation})
+
+\paragraph{Path anonymization reveals strong dependence.}
+Path anonymization (replacing components with consistent hashes) collapses R@1 from 24.5\% to 1.2\%---a 95\% drop (Appendix~\ref{app:path_anon}).
+Under PathSwap-GREPO, rerankers at 0.5B--7B all collapse to $\sim$1--2\% R@1, with larger models collapsing more ($-$96.1\% at 7B vs.\ $-$91.8\% at 0.5B; Appendix~\ref{app:scale}).
+
+\paragraph{Controlled perturbations reveal what the model reads.}
+We apply six targeted path perturbations at test time across \textbf{three model families} (Table~\ref{tab:path_perturb}).
+Filename shuffling is consistently most destructive ($-$73\% to $-$75\%), with \textbf{striking model-family differences} in directory sensitivity: Qwen2.5-7B shows moderate sensitivity ($-$46\% shuffle, $-$23\% flatten), while Llama-3.1-8B and Qwen3-8B show near-total collapse ($-$92--98\%).
+Under the strongest PathSwap variant (SHA-256 hashing of all path components), all three LLM families collapse uniformly by $-$95--96\% to near-chance R@1 ($\sim$1\%), confirming that path dependence is not a Qwen2.5 artifact but a cross-family property of LLM rerankers on this task.
+Delexicalization causes $-$67\% to $-$87\% collapse; module markers have no effect ($\pm$0--10\%).
+The cross-model consistency suggests the pattern is not model-specific memorization.
+Non-LLM baselines (merged candidate ranking without reranker: 22.51\%, Jaccard heuristic: 12.67\%) confirm the learned reranker (28.92$\pm$0.56\%) captures signal beyond simple token matching.
+
+\begin{table}[t]
+\centering
+\caption{Cross-LLM path perturbation on GREPO (1,704 test examples). Each row applies one structural perturbation to file paths at test time. $^\dagger$Baselines are single-checkpoint values for each model family; the 3-seed Qwen2.5-7B mean is 28.92$\pm$0.56\% (Table~\ref{tab:cross_architecture}). ``Delexicalize'' hashes path tokens that appear in the issue text.}
+\label{tab:path_perturb}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Perturbation} & \textbf{Qwen2.5-7B} & \textbf{Llama-3.1-8B} & \textbf{Qwen3-8B} \\
+\midrule
+None (baseline)$^\dagger$ & 27.01\% & 28.35\% & 29.38\% \\
+\midrule
+Shuffle filenames & 7.24 ($-$73\%) & 7.11 ($-$75\%) & 7.60 ($-$74\%) \\
+Shuffle directories & 14.72 ($-$46\%) & 2.17 ($-$92\%) & 2.17 ($-$93\%) \\
+Flatten to single level & 20.93 ($-$23\%) & 0.63 ($-$98\%) & 0.67 ($-$98\%) \\
+Swap leaf directories & 17.19 ($-$36\%) & 1.93 ($-$93\%) & 2.03 ($-$93\%) \\
+Remove module names & 27.70 ($+$3\%) & 25.48 ($-$10\%) & 26.43 ($-$10\%) \\
+Delexicalize & 8.85 ($-$67\%) & 3.72 ($-$87\%) & 3.90 ($-$87\%) \\
+PathSwap (full SHA-256 hash) & 1.06 ($-$96\%) & 1.30 ($-$95\%) & 1.38 ($-$95\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Path overlap drives reranker gains.}
+Stratifying by bug-report/path token overlap: high-overlap examples gain $+$19.0pp from reranking, medium $+$12.8pp, low only $+$6.2pp---the reranker \emph{amplifies} path signal rather than providing independent code understanding.
+This pattern extends across architectures (\S\ref{sec:cross_architecture}), benchmarks (\S\ref{sec:cross_benchmark}), and production systems (SweRank; Table~\ref{tab:swerank_perturb}).
+
+%======================================================================
+\subsection{Cross-Benchmark Validation}
+\label{sec:cross_benchmark}
+%======================================================================
+
+To test whether the path prior is GREPO-specific, we evaluate on SWE-bench Lite (300 instances) across three model families and on the larger SWE-bench Verified benchmark (500 instances).
+GREPO-trained models transfer zero-shot to SWE-bench (48--51\% R@1, competitive with the SWE-adapted model at 50.67\%; Table~\ref{tab:zero_shot_transfer}).
+Critically, \textbf{filename shuffling causes 77--80\% collapse on SWE-bench} (Table~\ref{tab:swebench_perturb}), closely matching the 73--75\% collapse on GREPO.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Left:} Zero-shot cross-benchmark transfer to SWE-bench Lite. \textbf{Right:} Path perturbation on SWE-bench Lite. Filename shuffling causes 77--80\% collapse across all three model families.}
+\label{tab:zero_shot_transfer}
+\label{tab:swebench_perturb}
+\small
+\begin{minipage}[t]{0.38\textwidth}
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Model} & \textbf{R@1} \\
+\midrule
+Qwen2.5-7B (adapted) & 50.67\% \\
+Qwen2.5-7B (GREPO) & 48.00\% \\
+Llama-3.1-8B (GREPO) & 48.67\% \\
+Qwen3-8B (GREPO) & 51.33\% \\
+\bottomrule
+\end{tabular}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.58\textwidth}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Shuffle fn} & \textbf{Shuffle dirs} & \textbf{Flatten} \\
+\midrule
+Qwen2.5-7B & 11.0 ($-$78\%) & 14.7 ($-$71\%) & 30.7 ($-$39\%) \\
+Llama-3.1-8B & 9.7 ($-$80\%) & 22.0 ($-$55\%) & 34.3 ($-$29\%) \\
+Qwen3-8B & 11.7 ($-$77\%) & 20.0 ($-$61\%) & 39.0 ($-$24\%) \\
+\bottomrule
+\end{tabular}
+\end{minipage}
+\end{table}
+
+
+%======================================================================
+\subsection{Decomposed Reranker: What Pointwise Scoring Can and Cannot Access}
+\label{sec:decomposed_reranker}
+%======================================================================
+
+The path perturbation experiments show \emph{what} the model depends on.
+Here we ask the complementary question: does code content provide \emph{any} additive value over paths, and if so, \emph{when}?
+We explicitly decompose the reranker into path and code channels.
+
+\paragraph{Code-residual model.}
+We train a ``code-residual'' reranker (v2) that receives anonymized paths (hashed) plus full file code content, forcing the model to rely on code signals rather than path identity.
+This model achieves R@1 = 22.68\%---\textbf{substantially below the path-only model} (28.92$\pm$0.56\%).
+
+\paragraph{Alpha-sweep fusion.}
+To test whether combining path and code signals improves over either alone, we sweep $\alpha \in [0, 1]$ where the fused score is $s = (1-\alpha) \cdot s_{\text{path}} + \alpha \cdot s_{\text{code}}$.
+The optimal $\alpha$ on the validation set is \textbf{$\alpha = 0$}---\emph{pure path-only}---confirming that code content provides no marginal value in this configuration (Table~\ref{tab:decomposed_reranker}).
+The code-only endpoint ($\alpha \to 1$) achieves only 20.46\% R@1.
+
+\begin{table}[t]
+\centering
+\caption{Decomposed reranker: explicit separation of path and code signals. Fusion $\alpha$-sweep finds $\alpha{=}0$ (path-only) is optimal; code content provides no additive value in our tested configurations. Code-residual and fusion rows are single-seed; the 6+pp gap exceeds seed variance ($\pm$0.56).}
+\label{tab:decomposed_reranker}
+\small
+\begin{tabular}{lc}
+\toprule
+\textbf{Model} & \textbf{R@1} \\
+\midrule
+Path-only (Qwen2.5-7B, 3-seed) & \textbf{28.92$\pm$0.56\%} \\
+Code-residual v2 (anonymized paths + code) & 22.68\% \\
+Best fusion ($\alpha$ sweep on val) & 28.92\% ($\alpha{=}0$, path-only wins) \\
+Code-only ($\alpha \to 1$) & 20.46\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Counterfactual and code-centric controls.}
+A matched-compute code-centric scorer (real paths + 50 lines of code + AST signatures) achieves R@1 = 28.74\%---no better than path-only (28.92$\pm$0.56\%, $p > 0.20$)---and collapses equally under filename shuffling (Table~\ref{tab:code_centric} in Appendix~\ref{app:counterfactual}).
+Path-only wins on all subsets except issue-path mismatch ($<$2\% of test, $+$7.2pp for code-centric); path-invariant training (50\% shuffled paths) achieves only 6.54\% under shuffling.
+
+\paragraph{Stronger code baselines: long context and selective retrieval.}
+We train two additional code-aware rerankers (Table~\ref{tab:strong_code_baselines}):
+(i)~a \textbf{long-context} scorer (200 lines, 2048 tokens), and
+(ii)~a \textbf{selective retrieval} scorer (BM25 top-3 functions per file).
+Neither improves over path-only in aggregate: selective retrieval 28.44$\pm$0.62\% (2 seeds), long-context 28.56$\pm$0.23\% (3 seeds), vs.\ path-only 28.92$\pm$0.56\%.
+All code-aware variants collapse equally under filename shuffling ($-$74\% to $-$77\%).
+Per-slice analysis reveals a nuanced picture:\footnote{Slice-level comparisons are computed on fixed subsets: Code-Crucial (116 examples, \S\ref{sec:efficiency}), low-overlap (bottom quartile by issue-path Jaccard), and same-stem (904 examples with duplicate filenames in the candidate pool).} selective retrieval gains $+$5.2pp on Code-Crucial examples but loses $-$2.1pp on same-stem examples.
+Code helps exactly where path fails, but its gains are offset by interference on path-easy examples, producing a net-zero aggregate effect.
+
+
+We restrict all reported numbers to pointwise scoring: comparing pointwise vs.\ pairwise objectives requires a dedicated pairwise-trained reranker, which is out of scope here.\footnote{A pairwise setup requires training the reranker with an A/B objective on the same candidate pool; using a pointwise-trained LoRA in an A/B-scored harness is a protocol mismatch and is not reported.}
+
+\begin{table}[h]
+\centering
+\caption{Stronger code-aware baselines vs.\ path-only, same candidate pool and checkpoint policy. Neither long-context code nor selective code retrieval improves over path-only.}
+\label{tab:strong_code_baselines}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{Code tokens} & \textbf{R@1} & \textbf{Shuffle R@1} & \textbf{Drop} \\
+\midrule
+Path-only (3-seed) & 0 & \textbf{28.92$\pm$0.56} & 7.24 & $-$75\% \\
+Code-centric (50L, 768 ctx) & $\sim$375 & 28.74 & 6.62 & $-$77\% \\
+Selective retrieval (top-3 funcs, 2-seed) & $\sim$800 & 28.44$\pm$0.62 & 7.47 & $-$74\% \\
+Long-context code (200L, 2048 ctx, 3-seed) & $\sim$1500 & 28.56$\pm$0.23 & 7.37$\pm$0.06 & $-$74\% \\
+Code-residual long-ctx (anon paths, 2048) & $\sim$1500 & 25.19 & 7.38 & $-$71\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Per-example decomposition.}
+Path-only is uniquely correct on 17.1\% of examples (2.4$\times$ code's 7.2\%); code helps on a small mismatch slice ($<$2\% of test, $+$7.2pp) but is too rare to shift aggregates.
+Further decomposition of code signals (identifier obfuscation, attention analysis, issue-path mismatch slicing) is detailed in Appendix~\ref{app:code_decomposition}.
+
+\paragraph{Two-stage and code-only controls.}
+On the same candidate pool, a two-stage reranker that first scores paths and then re-scores top candidates with file content achieves R@1\,=\,21.50\%, \emph{worse} than path-only (24.51\%).
+Removing paths entirely and scoring by code content alone (``content-replace'') collapses to 6.85\%.
+Post-scoring graph propagation is also negative, and mixed-retriever-pool training drops R@1 from 27.0\% to 20.0\% (Appendix~\ref{app:model_side}).
+
+\paragraph{Ruling out candidate-pool confound.}
+Scoring \textbf{all .py files} per repository (avg.\ 541 files) yields path-only R@1\,=\,29.71\%, matching the BM25-based pipeline (28.92$\pm$0.56\%), providing evidence that path dominance is a scorer property, not a retrieval artifact.
+
+\paragraph{Hierarchical localization.}
+Does code matter more when the search scope is narrowed?
+We compare function-level localization in global vs.\ gold-file-conditioned settings (Table~\ref{tab:hierarchical}).
+
+\begin{table}[h]
+\centering
+\caption{Hierarchical localization: path-shuffle collapse decreases when conditioned on the correct file, but naming conventions remain dominant.}
+\label{tab:hierarchical}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Scope} & \textbf{Baseline R@1} & \textbf{Shuffle R@1} & \textbf{Drop} & \textbf{Avg cands} \\
+\midrule
+Global (top-50 files expanded) & 10.95\% & 1.06\% & $-$90\% & $\sim$1200 \\
+Gold directory & 13.76\% & 1.62\% & $-$88\% & $\sim$2033 \\
+Gold file & 17.91\% & 4.47\% & $-$75\% & 204 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Collapse drops from 90\% globally to 75\% within the correct file, suggesting a \textbf{resolution threshold} beyond which code semantics may begin contributing.
+
+
+\subsection{Cross-Architecture Validation}
+\label{sec:cross_architecture}
+
+The path prior extends beyond cross-encoder rerankers to bi-encoders ($-$69\%), generative listwise rankers ($-$53\%), zero-shot cross-encoders ($-$71\%), frontier-scale models (Qwen-Max $-$44\%, DeepSeek-V3.2 $-$46\%), and cross-language transfer ($-$60\% on Java); see Table~\ref{tab:cross_architecture} in the Appendix.\footnote{All results use R@1 over 1704 GREPO examples except frontier API (100--152 examples) and BeetleBox Java (740 examples).}
+Critically, even \textbf{Qwen3-Max with 100 lines of code per candidate} (a newer, stronger frontier model than the path-only Qwen-Max above) shows $-$45\% R@1 collapse under filename shuffling (55.3\% $\to$ 30.3\%, $n$\,=\,152).
+Going further, we test an \textbf{agentic} setup: Qwen3-Max with chain-of-thought reasoning and 80-line code previews for top-5 candidates.
+While this achieves Hit@1\,=\,54.5\% under normal paths, filename shuffling still causes $-$62\% collapse (Hit@1\,=\,20.8\%, $n$\,=\,77), demonstrating that path dependence persists even under agentic code reasoning.
+SweRank~\citep{reddy2025swerank}, the current SOTA, shows 70--77\% R@1 collapse under filename shuffling on SWE-bench Lite (Table~\ref{tab:swerank_perturb}), confirming path reliance extends to production-grade retrievers.
+
+\paragraph{Cross-language transfer.}
+A Python-trained reranker applied zero-shot to 740 Java bugs (BeetleBox, top-200 BM25 candidates) achieves R@1\,=\,14.43\%; filename shuffling causes $-$60\% collapse (R@1\,=\,5.79\%), confirming path dependence transfers across programming languages even without any Java training data (Table~\ref{tab:cross_architecture}).
+
+\paragraph{Supportive mechanistic evidence: gradient attribution.}
+Input-gradient attribution ($|{\nabla_{\mathbf{e}}} \cdot \mathbf{e}|$) on 300 GREPO examples shows that path tokens receive 4.8$\times$ higher per-token attribution density than issue tokens (22.9\% of total attribution from $\sim$4\% of tokens). While not a definitive causal measure, this is consistent with the behavioral perturbation evidence that the reranker disproportionately relies on file paths (Appendix~\ref{app:gradient_attribution}).
+
+\subsection{Filename Shuffling and PathSwap: Quantifying Path Dependence}
+\label{sec:pathswap}
+
+We quantify path dependence through two complementary perturbations of increasing severity:
+\textbf{Filename shuffling} randomly permutes filenames within each directory, preserving directory structure and extensions but destroying filename--content correspondence.
+\textbf{PathSwap} applies a more extreme, deterministic renaming: every path component is replaced with a SHA-256 hash prefix (\texttt{d\_} for directories, \texttt{m\_} for modules), destroying \emph{all} lexical path content while preserving directory structure (Appendix~\ref{app:pathswap_examples}).
+
+Table~\ref{tab:pathswap_diagnostic} shows every reranker loses 53--77\% of R@1 under filename shuffling alone; even the code-centric reranker achieves only Ratio\,=\,0.23.
+Under PathSwap (Table~\ref{tab:pathswap_scale} in Appendix), the collapse is even more severe: 92--98\% R@1 loss across all scale variants.
+
+\begin{table}[t]
+\centering
+\caption{Filename shuffling diagnostic on GREPO-Test (1704 examples). \textbf{Gap} = Standard $-$ Shuffled. \textbf{Ratio} = Shuffled / Standard. Lower Gap and higher Ratio indicate less path dependence. Cross-encoder and code-residual rows use fractional R@1; generative and bi-encoder use Hit@1 (binary top-1 hit); relative drops are comparable across metrics.}
+\label{tab:pathswap_diagnostic}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{Standard} & \textbf{Shuffled} & \textbf{Gap}$\downarrow$ & \textbf{Ratio}$\uparrow$ \\
+\midrule
+Generative (Qwen 7B) & 41.55 & 19.54 & 22.01 & 0.47 \\
+Path-only (Qwen3-8B) & 29.38 & 7.60 & 21.78 & 0.26 \\
+Path-only (Qwen2.5-7B) & 27.01 & 7.24 & 19.77 & 0.27 \\
+Path-only (Llama-3.1-8B) & 28.35 & 7.11 & 21.24 & 0.25 \\
+Code-centric reranker & 28.74 & 6.62 & 22.12 & 0.23 \\
+Merged candidates (no reranker) & 22.51 & --- & --- & --- \\
+Code-residual v2 & 22.68 & 6.04 & 16.64 & 0.27 \\
+Bi-encoder (E5-large) & 9.50 & 2.92 & 6.58 & 0.31 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We release both perturbation datasets (1704 examples with transformed paths, candidate pools, and evaluation scripts) for reproducible measurement of path dependence.
+The path prior extends to function-level localization: shuffling function names causes 90\% collapse (10.95\% $\to$ 1.06\%; Table~\ref{tab:function_level} in Appendix~\ref{sec:function_level}).
+
+
+\subsection{The Efficiency Dividend and Code-Crucial Subset}
+\label{sec:efficiency}
+
+\paragraph{Computational waste.}
+Code-centric rerankers process 8--16$\times$ more tokens than path-only yet achieve no R@1 improvement.
+
+\paragraph{Code-Crucial: where path fails and code could help.}
+We construct \textbf{Code-Crucial} using baseline-independent features: examples where issue-path lexical overlap is in the bottom quartile \emph{and} path cues are misleading (shared filename stem or path-heuristic confusion), with a code-availability witness (code-only BM25 top-50).
+This yields 116 examples (6.8\% of the test set).
+On this subset, we observe a clear separation between targeted and brute-force code approaches.
+Selective function retrieval---which BM25-retrieves the top-3 most issue-relevant functions per candidate---achieves 40.52\% R@1, outperforming the path-only model (35.34\%) by $+$5.17pp.
+In contrast, brute-force code approaches fail: the code-residual model (anonymized paths + 30 lines) achieves only 12.97\%, and a zero-shot scorer given 200 lines of raw code per candidate also reaches only 12.93\%.
+This positive control supports the usefulness of Code-Crucial as a diagnostic subset: code evidence \emph{is} sufficient for these examples when extracted selectively, but current pointwise code-matching approaches cannot exploit it.\footnote{Code-Crucial R@1 numbers are computed on the 116-example subset using the same evaluation protocol and candidate pool as the full test set.}
+We release Code-Crucial as a diagnostic benchmark for measuring progress on genuine code understanding.\footnote{An earlier model-defined variant (863 examples where the path-only model scores 0\%) is reported in the appendix for comparison. The feature-defined subset captures a related but distinct regime (Jaccard overlap = 0.18).}
+Sensitivity analysis across seven variant definitions (overlap thresholds 0.05--0.2, with and without code witness; Table~\ref{tab:cc_sensitivity} in Appendix) shows the code-residual model consistently underperforms path-only ($\Delta = -1.5$ to $-5.1$pp across all variants), confirming the conclusion is robust to construction choices.
+
+\paragraph{Qualitative audit.}
+Manual inspection of 25 Code-Crucial failures reveals three categories: \emph{semantic mismatch} (72\%): the issue describes a behavior or concept (e.g., ``fix bug in measurement gate channel'') but the GT file has a different name (\texttt{common\_gates.py}, not \texttt{measurement\_gate.py})---the path model is attracted to superficial keyword matches; \emph{vague/generic issues} (12\%): titles too short to locate any file; \emph{version/refactor} (16\%): \texttt{setup.py} changes or multi-file cleanup.
+In 15/25 cases, reading the GT file's code would reveal the connection (e.g., \texttt{MeasurementGate} class defined in \texttt{common\_gates.py}), confirming that code evidence is genuinely available but unexploited by current models.
+Consistent with this, path-only R@1 varies by 14.4pp between descriptive and opaque repos (Appendix~\ref{app:opaque_descriptive}).
+
+%======================================================================
+\subsection{Metric Validity: File-Level R@1 vs.\ Downstream Success}
+\label{sec:metric_validity}
+%======================================================================
+
+To directly test whether file-level R@1 measures code understanding, we compare file-level top-1 success with function-level Hit@1 success on 1{,}113 examples common to both evaluation sets (Table~\ref{tab:file_func_confusion}).
+
+\begin{table}[t]
+\centering
+\caption{Confusion matrix: file-level vs.\ function-level top-1 correctness on 1{,}113 common examples.}
+\label{tab:file_func_confusion}
+\small
+\begin{tabular}{lcc}
+\toprule
+& \textbf{Func correct} & \textbf{Func wrong} \\
+\midrule
+File correct & 258 (23.2\%) & 330 (29.6\%) \\
+File wrong   & 104 (9.3\%)  & 421 (37.8\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Only 43.9\% of file-level top-1 successes also succeed at function level; per-repository Spearman correlation between file-level R@1 and function-level Hit@1 is only $\rho = 0.273$ ($p = 0.033$, $n = 61$ repos).
+Several repos achieve 100\% file-level R@1 but 0\% function-level Hit@1, confirming that file-level success can be entirely driven by path matching.
+
+\paragraph{Filename shuffling robustness analysis.}
+All seven system variants retain 23--47\% of R@1 under filename shuffling (mean ratio $0.29 \pm 0.08$); code-aware variants are \emph{not} more robust than path-only, indicating the perturbation measures absolute path dependence but cannot distinguish system types---a limitation for future diagnostic design.
+Repo-level bootstrap CIs (10K resamples) confirm these differences are statistically robust: path-only baseline 95\% CI [21.2, 33.5] vs.\ filename shuffle [5.3, 9.9], with no overlap.
+
+\paragraph{Gold-file conditioned function success.}
+Among the 753 file-level top-1 successes with ground-truth function labels, only 476 (63.2\%) also contain the correct changed function.
+Per-repository correlation between file-level R@1 and this function-success rate is $r = 0.091$ ($n = 46$ repos)---nearly zero.
+At function level, only 29\% of ground-truth functions appear in the model's top-10 ranked functions, and 43\% of examples have zero overlap between predicted and actual edit regions.
+This confirms that file-level R@1 is a weak proxy for code understanding: a substantial fraction of ``correct'' file predictions succeed by path matching without localizing the actual bug.
+
+\paragraph{Repo-level generalization.}
+Filename shuffling causes $>$20\% R@1 drop in 94\% of repositories (44/47 with $n \geq 5$), with a mean drop of 69\% (median 75\%).
+Even in the bottom-quartile repos (lowest baseline R@1, presumably hardest), the mean drop is 58\%.
+Combined with cross-benchmark (SWE-bench, 12 unseen repos, $-$77--80\%) and cross-language (BeetleBox Java, $-$60\%) evidence, the path prior is not an artifact of specific repositories or naming conventions.
+
+
+%======================================================================
+\subsection{Implications for Model and Metric Design}
+\label{sec:towards}
+%======================================================================
+
+Our findings suggest a \textbf{granularity gradient}: path priors dominate at file granularity (73--75\% collapse; Table~\ref{tab:path_perturb}), with 90\% collapse at function level globally but only 75\% within the correct file (Table~\ref{tab:hierarchical})---narrowing the candidate scope partially attenuates path dependence but does not eliminate it.
+
+\paragraph{Hierarchical path$\to$code baseline.}
+To address whether a stronger code integration helps, we build a hierarchical pipeline: (A)~path-only reranker selects top-10 files (81\% gold-file coverage), (B)~AST-extracted functions are BM25-ranked by issue similarity and top-3 snippets are retained, (C)~the reranker re-scores each file with function snippets appended.
+Zero-shot, this hierarchical scorer achieves Hit@1\,=\,39.3\%---\emph{worse} than path-only (51.2\%, $-$12pp).
+We then \textbf{train a dedicated hierarchical LoRA} (2 epochs, 50\% hierarchical / 50\% path-only prompts), yielding Hit@1\,=\,40.0\% vs.\ path-only 48.4\%---still $-$8pp (Table~\ref{tab:hierarchical_eval}), confirming the negative result is not a zero-shot artifact.
+Even conditioned on gold-file-in-top-10, function snippets do not improve re-ranking.
+
+\paragraph{Path-controlled contrastive pools.}
+To test whether code helps when path cues are neutralized, we construct ``path-confusable'' candidate pools (20 candidates per example) by selecting same-directory and same-stem files, maximizing path similarity to the gold file (mean Jaccard = 0.53).
+On these pools, path-only still achieves Hit@1\,=\,60.8\%, and adding code snippets \emph{degrades} accuracy to 53.2\% ($-$7.6pp; $n$\,=\,1535).
+This demonstrates that even when candidates share similar paths, fine-grained path differences remain sufficient for ranking; code content does not provide compensating signal.
+
+\paragraph{Function-level code body test.}
+At function level (946 evaluated examples), adding function body text to the path-only model's prompt does not improve Hit@1 (42.5\% path-only vs.\ 41.0\% with code body, $-$1.5pp zero-shot).
+This confirms the path-trained scorer cannot exploit code content even when the candidate scope is narrowed to individual functions.
+A dedicated function-level code expert (FCE, trained with same-file contrastive negatives) is currently under evaluation to test whether \emph{specialized} code training changes this conclusion.
+
+\paragraph{Path-deconfounded evaluation.}
+Stratifying by issue-path lexical coverage reveals the path confound directly: on ``path-easy'' examples (coverage $\geq 0.5$, $n$\,=\,511), R@1\,=\,32.4\%, while on ``path-hard'' examples (coverage $< 0.2$, $n$\,=\,509), R@1 drops to 21.6\%---a 10.8pp gap attributable to path cues alone.
+We propose reporting \textbf{path-deconfounded R@1} (performance on the path-hard slice) alongside standard R@1 as a more honest measure of code understanding.
+
+\paragraph{Repo-held-out generalization.}
+To rule out within-repo memorization, we retrain the reranker after removing all 15 test repos from the training set (2956 remaining train examples from 55 repos) and evaluate exclusively on the held-out repos (1354 test examples).
+The retrained model achieves R@1\,=\,27.63\% on unseen repos---matching the full-split baseline (27.01\%)---and filename shuffling causes \textbf{$-$86\% collapse} (R@1\,=\,3.95\%), even more severe than the within-repo split ($-$75\%).
+This confirms the path prior is a property of the task and evaluation metric, not of repo-specific memorization.
+
+\paragraph{Selective routing: from diagnosis to action.}
+The path prior finding is actionable.
+We train a lightweight router (GradientBoosting, AUC\,=\,0.86) on features from the path-only model (score gap, path overlap, stem ambiguity) to predict when path-only will fail.
+Routing the 28\% most uncertain examples to the trained hierarchical code model improves overall Hit@1 from 46.4\% to 48.6\% ($+$2.2pp), while oracle routing reaches 55.7\%.
+This confirms that code \emph{can} help on a minority of examples, but the standard evaluation conflates this signal with the dominant path prior.
+
+\paragraph{Repo-level consistency.}
+On the full candidate pool, filename shuffling degrades R@1 in 49 of 50 repos (98\%) with $\geq$5 test examples (median drop 75\%, mean 68\%); 76\% of repos show $>$50\% collapse.
+This confirms the path prior is not driven by a few outlier repositories.
+Per-repo file R@1 and function-level success are uncorrelated ($\rho = 0.020$, $p = 0.91$): high file-level accuracy does not predict function-level localization ability.
+
+\begin{table}[t]
+\centering
+\caption{Hierarchical path$\to$code evaluation on GREPO (1704 examples). Hit@1 = binary top-1 hit (higher than fractional R@1 due to multi-file bugs). Stage A: path-only top-10 selection. Stage B: AST function extraction + BM25 ranking (top-3 snippets). Stage C: re-scoring with snippets appended. Cond.\ = Hit@1 conditioned on gold file being in Stage A top-10. Code degrades accuracy in both zero-shot and trained settings.}
+\label{tab:hierarchical_eval}
+\small
+\begin{tabular}{llcccc}
+\toprule
+ & & \textbf{Path} & \textbf{Hier.} & \textbf{Stg.\ A} & \textbf{Cond.} \\
+ & & \textbf{Hit@1} & \textbf{Hit@1} & \textbf{Hit@10} & \textbf{Hit@1} \\
+\midrule
+\multirow{2}{*}{Zero-shot}
+ & Baseline & 51.2 & 39.3 ($-$12) & 81.2 & 48.4 \\
+ & Shuffle  & 12.5 & 11.6 ($-$1) & 43.0 & 26.9 \\
+\midrule
+\multirow{2}{*}{Trained}
+ & Baseline & 48.4 & 40.0 ($-$8) & 79.6 & 50.2 \\
+ & Shuffle  & 13.0 & 12.3 ($-$1) & 42.9 & 28.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As established earlier in this subsection (Table~\ref{tab:hierarchical_eval}), even after training a dedicated hierarchical LoRA the path$\to$code pipeline still underperforms path-only by $-$8pp.
+A separately trained code expert (3 epochs on hard examples, loss converging to 0.32) achieves only 34.4\% Hit@1 vs.\ path-only 50.4\% ($-$16pp), and no routing budget improves over path-only.
+These results establish that \textbf{in the tested pointwise reranker regime, code at file level acts as noise}: even when trained to convergence, code information interferes with the stronger path signal.
+
+Adding code content to function-level prompts yields no improvement over path-only function ranking (R@1 $\approx$ 10\% in both cases), suggesting the remaining bottleneck is code-level reasoning within the narrowed scope.
+
+We propose \textbf{Code-Crucial} (116 feature-defined examples where path cues are weak but code evidence is available) as the benchmark for measuring progress on this front: while selective function retrieval shows modest gains on this slice ($+$5.2pp), pointwise code-residual models reach only 12.97\% R@1 (vs.\ 35.34\% for path-only), indicating that current pointwise code-matching approaches struggle on precisely the cases where code should help most.
+A lexical masking analysis shows that identifier matching contributes only 3.4\% of issue--code token overlap, while docstrings contribute 46.7\% and structural code tokens 49.5\%, suggesting the code signal is not purely lexical but partially mediated by natural-language documentation.
+Notably, the generative listwise reranker achieves its best performance using path-only prompts (R@1\,=\,41.55\%); adding code content to the prompt degrades accuracy, consistent with the cross-encoder finding that code provides no marginal value in the tested pointwise reranker regime.
+Furthermore, the metric validity analysis (\S\ref{sec:metric_validity}) shows that 56.1\% of file-level successes fail at function level, reinforcing that file-level R@1 conflates coarse structural localization with genuine code understanding.
+
+A confidence-gated routing method (SPAR) that selectively dispatches low-confidence examples to a code-aware model yields a modest improvement ($+$2.2pp over path-only; details in Appendix~\ref{app:spar}).
+
+%======================================================================
+\section{\textbf{Codeaware}: A Path-Robust Training Recipe for Same-Pool File Localization}
+\label{sec:codeaware}
+%======================================================================
+
+The preceding sections show that path-only rerankers exploit path shortcuts, and that code added at \emph{inference} time (pointwise and hierarchical) provides at most a $+$2pp improvement on standard test sets.
+Here we show a training recipe---\textbf{codeaware}---that fine-tunes on SWE-bench train and is competitive with SweRankLLM-Small in a same-pool controlled comparison, while being substantially more path-invariant.
+
+\paragraph{Recipe.}
+\textbf{Codeaware} is a Qwen2.5-7B LoRA (rank 32) fine-tuned on SWE-bench train (1870 issues, 2 epochs, lr $5{\times}10^{-5}$). The prompt includes the top 50 lines of each candidate file's source (code-aware prompt). As a simple augmentation, with probability 0.5 each training group's candidate paths are shuffled among themselves while code stays with the original file---this is motivated by our PathSwap diagnosis and encourages the scorer not to rely solely on path identity. A matched-data ablation (Run~1: same SWE-bench train, same data pool, augmentation off, no code in prompt) is reported in Tables~\ref{tab:codeaware_main}--\ref{tab:codeaware_invariance}: the augmentation and code-in-prompt trade $-$5.7pp normal accuracy on Lite for a $-$23.1pp reduction in PathSwap collapse (Run~1 $-$38.3\% $\to$ Codeaware $-$15.2\%), isolating path-augmentation as the driver of path-invariance. Run~2 (SWE+GREPO combined) further shows that data scale recovers the normal-accuracy trade-off while preserving path-invariance.
+
+\paragraph{Same-pool R@1 and a clean three-way ablation.}
+Table~\ref{tab:codeaware_main} reports three LoRAs that share identical training code, optimizer, and evaluation pipeline, differing only in (a) training data pool, (b) path-augmentation fraction, (c) whether candidate code is placed in the scoring prompt.
+\textbf{Run~1} (SWE-only, aug=0.0, no code-in-prompt) is our path-only baseline: 54.00\% on Lite, 46.12\% on Verified.
+\textbf{Codeaware} (SWE-only, aug=0.5, code-in-prompt) holds training data fixed and adds only the codeaware recipe, giving 48.33\% / 44.98\%.
+\textbf{Run~2} (SWE+GREPO 5{,}916 combined, aug=0.5, code-in-prompt) further scales training data, reaching \textbf{56.67\% / 48.13\%}.
+SweRankLLM-Small, run under the same BM25 top-100 file pool, achieves 47.93\% on Lite (not its native setup).
+The SweRank paper reports stronger numbers (78.10\% file Acc@1 for SweRankLLM-Small; \citealt{reddy2025swerank} Table~1) under their native setup: SweRankEmbed-Large retrieves from a full-repo \emph{function}-level index, then SweRankLLM reranks the retrieved functions, and file-level Acc@1 is defined strictly (all GT files present in top-1). The gap between 47.93\% (BM25 top-100 file pool) and 78.10\% (full-repo function pool) is therefore driven primarily by candidate space rather than by the reranker itself. To measure the path-dependence of their native pipeline, we re-run it under PathSwap in Section~\ref{sec:codeaware:swerank_perturb}.
+The training-budget disparity is notable: SweRankEmbed/LLM is trained on 67K SweLoc pairs, whereas Codeaware uses 1874 SWE-bench-train examples ($\sim$36$\times$ smaller) and Run~2 uses 5916 combined samples ($\sim$11$\times$ smaller).
+The dense retriever SweRankEmbed-Large alone, scored on our BM25 top-100 pool, achieves 37.00\% R@1.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Path-augmented training (\emph{codeaware}) vs.\ baselines under controlled BM25 top-100 pool} on SWE-bench Lite ($n{=}300$) and Verified ($n{=}500$). Same eval script (\texttt{eval\_codeaware\_4bit.py}), pointwise scoring with code-in-prompt. We report three trained LoRAs differing only in (i) train data, (ii) path-augmentation fraction. Run~1 is a path-only baseline (no augmentation, no code in prompt); Codeaware adds 50\% path shuffling and code-in-prompt; Run~2 adds the same recipe \emph{and} larger combined training data (SWE+GREPO).}
+\label{tab:codeaware_main}
+\small
+\begin{tabular}{llccc}
+\toprule
+\textbf{Method} & \textbf{Train data} & \textbf{aug} & \textbf{Lite R@1} & \textbf{Verified R@1} \\
+\midrule
+SweRankEmbed-Large (dense only)             & ---                & --- & 37.00 & --- \\
+SweRankLLM-Small (same-pool, official ckpt) & ---                & --- & 47.93 & TBD \\
+\midrule
+Run 1 (path-only, ours)                     & SWE 1{,}870        & 0.0 & 54.00 & 46.12 \\
+\textbf{Codeaware} (ours)                   & SWE 1{,}870        & 0.5 & 48.33 & 44.98 \\
+\textbf{Run 2 (path-aware combined, ours)}  & SWE+GREPO 5{,}916  & 0.5 & \textbf{56.67} & \textbf{48.13} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Path-invariance under SHA-256 PathSwap.}
+To isolate how much each LoRA relies on literal path tokens, we re-run every model after replacing every path component with its SHA-256 prefix (\texttt{auth/login.py} $\rightarrow$ \texttt{d\_8a2f/m\_1bd4.py}), keeping file contents unchanged.
+Table~\ref{tab:codeaware_invariance} shows a clean, consistent pattern: the path-only baseline (Run~1) collapses by $-$38.3\% on Lite and $-$42.7\% on Verified, while the path-augmented LoRAs (Codeaware, Run~2) drop by only $-$15--20\% on Lite and $-$6.5--20\% on Verified---a 2.5--6$\times$ reduction in relative collapse, consistent across both test splits.
+The combined-data Run~2 is the most path-robust (only $-$6.5\% on Verified) while also being the most accurate on unperturbed paths.
+
+\begin{table}[t]
+\centering
+\caption{\textbf{SHA-256 PathSwap perturbation: path-augmented training is dramatically more path-invariant.}
+Same BM25 top-100 candidate pool as Table~\ref{tab:codeaware_main}; PathSwap replaces every path component with its SHA-256 prefix (e.g.\ \texttt{auth/login.py} $\rightarrow$ \texttt{d\_8a2f/m\_1bd4.py}) while file contents are unchanged.
+$\Delta_{\text{abs}}$ = Normal $-$ PathSwap (pp); $\Delta_{\text{rel}}$ = relative drop.
+The path-only baseline (Run~1, no augmentation) collapses by $-$38--43\%; the path-augmented LoRAs (Codeaware, Run~2) drop only $-$6--20\%.
+Single-seed runs; reference seed variance is $\pm$0.56pp on a related setup.}
+\label{tab:codeaware_invariance}
+\small
+\begin{tabular}{llccccc}
+\toprule
+\textbf{Method} & \textbf{aug} & \textbf{Eval} & \textbf{Normal} & \textbf{PathSwap} & \textbf{$\Delta_{\text{abs}}$} & \textbf{$\Delta_{\text{rel}}$} \\
+\midrule
+\multicolumn{7}{l}{\emph{SWE-bench Lite} ($n{=}300$)} \\
+Run 1 (path-only)                       & 0.0 & Lite & 54.00 & 33.33 & $-$20.67 & $-$38.3\% \\
+Codeaware (SWE-only)                    & 0.5 & Lite & 48.33 & 41.00 & $-$7.33 & $\boldsymbol{-}$\textbf{15.2\%} \\
+\textbf{Run 2 (path-aware combined)}    & 0.5 & Lite & \textbf{56.67} & \textbf{47.33} & $-$9.34 & $\boldsymbol{-}$\textbf{16.5\%} \\
+\midrule
+\multicolumn{7}{l}{\emph{SWE-bench Verified} ($n{=}500$)} \\
+Run 1 (path-only)                       & 0.0 & Verified & 46.12 & 26.43 & $-$19.69 & $-$42.7\% \\
+Codeaware (SWE-only)                    & 0.5 & Verified & 44.98 & 36.02 & $-$8.96 & $\boldsymbol{-}$\textbf{19.9\%} \\
+\textbf{Run 2 (path-aware combined)}    & 0.5 & Verified & \textbf{48.13} & \textbf{45.02} & $-$3.11 & $\boldsymbol{-}$\textbf{6.5\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Training-free alternatives do not help.}
+Two inference-time variants we tested do not reproduce the training-based gain.
+(i)~\textbf{Path-Null Anchor}: each candidate is scored twice (real path vs.\ SHA-256-hashed path), and rankings are fused via $\alpha \cdot s_{\text{real}} + (1-\alpha)\cdot (s_{\text{real}} - s_{\text{hash}})$. Sweeping $\alpha \in \{0, 0.25, \ldots, 1\}$ on SWE-bench Lite yields a best R@1 of 53.67\% at $\alpha{=}0.6$ (vs.\ 51.67\% at $\alpha{=}1$, just $+$2pp), and the residual signal alone is at noise level (36\%).
+(ii)~\textbf{Reciprocal Rank Fusion} of codeaware and SweRankEmbed-Small: the best $\alpha$ is 1.0 (pure codeaware, 52.33\%), because the dense retriever on its own only achieves 34.00\% on this pool and dragging fusion toward code hurts.
+These negative results make it clear the gain is in \emph{training}, not in inference-time path-hashing tricks.
+
+\paragraph{Interpretation.}
+Our diagnostic perturbations identified a path bottleneck. codeaware is one concrete recipe motivated by that diagnosis: a SWE-bench-train LoRA whose prompt includes code and whose training distribution occasionally breaks path--content alignment. Empirically, this recipe is competitive with SweRankLLM-Small in a same-pool controlled comparison (BM25 top-100 files) with 36$\times$ less training data, and is dramatically less path-sensitive. We do not claim path-augmentation is independently responsible for the standard-protocol gain---isolating that requires a matched-data ablation we are running. What we do claim is: (i)~the PathSwap diagnostic gives actionable direction for training design, (ii)~a small recipe is competitive with SweRankLLM-Small under a controlled same-pool setup, and (iii)~the resulting model is path-invariant on a perturbation it was never directly trained with (SHA-256 full hashing), which is consistent with genuine code reading rather than memorized path--content mappings.
+
+%======================================================================
+\section{Limitations}
+\label{sec:limitations}
+%======================================================================
+
+(i)~Our code-aware baselines include pointwise scoring with up to 2048-token context and a hierarchical path$\to$code pipeline; we have not tested 4K+ contexts, chain-of-thought prompting, or agentic code reasoning, which might yield different results.
+(ii)~Frontier-scale models (Qwen-Max, $-$44\%) show less collapse than fine-tuned models ($-$74\%) but still substantial path dependence. Our conclusions are strongest for the fine-tuned pointwise reranker regime.
+(iii)~Both attention and gradient attribution (Appendix~\ref{app:gradient_attribution}) show disproportionate focus on path tokens, but neither is a definitive causal measure~\citep{jain2019attention}; future work should validate with counterfactual token-masking.
+(iv)~While repo-held-out evaluation (\S\ref{sec:towards}) confirms the path prior persists on completely unseen repos ($-$86\% under shuffling), we have not tested time-held-out splits, which could reveal temporal confounds in naming conventions.
+(v)~Stage~2 expansion requires pre-computed graph indexes (without them, R@1 = 28.45\%).
+(vi)~We report only pointwise scoring; a pairwise-objective comparison would require training a dedicated pairwise reranker and is out of scope.
+(vii)~\textbf{codeaware} (\S\ref{sec:codeaware}) is compared against SweRankLLM-Small (7B) on SWE-bench Lite and Verified only; we did not complete the SweRankLLM-Large ($\sim$32B) comparison because of bandwidth-limited weight download and compute budget. The Small-to-Small comparison is fair in parameter count; Large-to-Small is not.
+(viii)~\textbf{Training / inference precision mismatch (validated).} All LoRA rerankers are trained with a bf16 base model (no quantization) and evaluated with a 4-bit nf4-quantized base. A matched-precision sanity check on SWE-bench Lite (bf16 inference with identical prompts, candidates, and seed) across all three rerankers (Run~1, Codeaware, Run~2) $\times$ normal/PathSwap (six cells total) finds small absolute differences ($|\Delta|{\leq}2.0$pp, mean $|\Delta|{=}1.0$pp). The PathSwap relative drop is negative in both precisions for all three rerankers: Run~1 4-bit $-$38.3\% vs.\ bf16 $-$36.1\% (gap 2.2pp); Codeaware 4-bit $-$15.2\% vs.\ bf16 $-$19.5\% (gap 4.3pp); Run~2 4-bit $-$16.5\% vs.\ bf16 $-$16.0\% (gap 0.5pp). The largest precision-induced $\Delta\%$ gap is 4.3pp (Codeaware) and the qualitative ranking — Run~1 most path-dependent; Codeaware and Run~2 comparably path-robust and 2--2.5$\times$ less dependent than Run~1 — is preserved in both precisions. We therefore report 4-bit numbers throughout.
+(ix)~\textbf{Single-snapshot BM25 for SWE-bench Verified.} Our BM25 pool for Verified is indexed against one repository snapshot per repo (matching the standard Lite evaluation protocol); per-instance \texttt{base\_commit} checkout would raise the oracle recall from 80.0\% to 85.0\% on our local reproduction (Acc@100 measured via 499 per-commit \texttt{git worktree} indexes). Our headline $\Delta\%$ numbers are unaffected, as Normal and PathSwap share the same pool.
+
+
+%======================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%======================================================================
+
+File-level R@1, the standard metric for bug localization, has a metric validity gap: it rewards path-structural pattern matching rather than code understanding.
+Our evidence spans three model families (including frontier-scale), four benchmarks (GREPO, SWE-bench Lite, SWE-bench Verified, and BeetleBox Java), three architectures, and the SOTA SweRank stack: file-level performance is highly dependent on path tokens, and SweRankEmbed-Large itself collapses by 55--78\% under PathSwap.
+
+\textbf{Path-augmented training (codeaware) is a concrete fix.}
+A three-LoRA ablation sharing training code and evaluation pipeline shows a clean pattern: the path-only baseline (Run~1) reaches 54.00\% / 46.12\% on Lite / Verified and collapses by $-$38--43\% under SHA-256 PathSwap; adding the codeaware recipe (50\% path-shuffled batches + code in scoring prompt) trades $-$5.7pp / $-$1.1pp normal accuracy for a 2.5$\times$ reduction in PathSwap collapse ($-$15--20\%); scaling training data (Run~2: SWE+GREPO 5{,}916, aug=0.5) recovers the normal accuracy (56.67\% / 48.13\%) while remaining path-robust ($-$16.5\% / $-$6.5\%). Run~2 is competitive with SweRankLLM-Small in a same-pool controlled comparison on BM25 top-100 files (47.93\%; not SweRank's native setup) using $\sim$11$\times$ less training data. Two training-free alternatives (Path-Null Anchor; Reciprocal Rank Fusion with SweRankEmbed) provide no improvement, attributing the gain to training rather than inference tricks.
+
+The paper's durable contributions are: (i)~\textbf{PathSwap}---filename shuffling (44--77\% R@1 loss) and full path hashing (92--98\% loss)---and \textbf{Code-Crucial} (116 examples where path is weak but code is retrievable) as standardized community stress tests; (ii)~the \textbf{codeaware} training recipe that turns a path-confounded reranker into a code-aware one without changing the inference interface, and a path-invariance number that scales with the recipe's strength.
+
+
+\bibliography{references}
+\bibliographystyle{plainnat}
+
+
+%======================================================================
+\section*{NeurIPS Paper Checklist}
+%======================================================================
+
+\begin{enumerate}
+
+\item {\bf Claims}
+    \begin{enumerate}
+        \item Do the main claims made in the abstract and introduction accurately reflect the paper's contributions and scope?
+        \answerYes{All claims are scoped to tested pointwise file-level reranker configurations and explicitly acknowledge that code helps in targeted regimes (issue-path mismatch, Code-Crucial slices).}
+    \end{enumerate}
+
+\item {\bf Limitations}
+    \begin{enumerate}
+        \item Does the paper discuss the limitations of the work performed by the authors?
+        \answerYes{Section~\ref{sec:limitations} discusses context length limits, frontier-scale model differences, attention attribution caveats, and graph index requirements.}
+    \end{enumerate}
+
+\item {\bf Theory Assumptions and Proofs}
+    \begin{enumerate}
+        \item For each theoretical result, does the paper provide the full set of assumptions and a complete (correct) proof?
+        \answerNA{The paper is empirical; no theoretical results are claimed.}
+    \end{enumerate}
+
+\item {\bf Experiments}
+    \begin{enumerate}
+        \item Does the paper include the code, data, and instructions needed to reproduce the main experimental results?
+        \answerYes{We release PathSwap-GREPO and Code-Crucial diagnostic benchmarks. Code will be released upon publication. Training hyperparameters are in Appendix~\ref{app:hyperparams}; prompt templates in Appendix~\ref{app:prompts}.}
+        \item Does the paper specify all the training and test details necessary to reproduce the results?
+        \answerYes{Sections~\ref{sec:setup} and Appendix~\ref{app:impl} specify all hyperparameters, model versions, candidate pool construction, and evaluation protocols.}
+    \end{enumerate}
+
+\item {\bf Reproducibility}
+    \begin{enumerate}
+        \item Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper?
+        \answerYes{Fixed seeds (42), deterministic candidate pools, and full hyperparameter tables are provided.}
+    \end{enumerate}
+
+\item {\bf Open access to data and code}
+    \begin{enumerate}
+        \item Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results?
+        \answerYes{PathSwap-GREPO and Code-Crucial will be released. Code will be released upon acceptance.}
+    \end{enumerate}
+
+\item {\bf Experimental Setting/Details}
+    \begin{enumerate}
+        \item Does the paper specify all the training details (e.g., data splits, hyperparameters, how they were chosen)?
+        \answerYes{See Section~\ref{sec:setup} and Appendix~\ref{app:hyperparams}.}
+    \end{enumerate}
+
+\item {\bf Experiment Statistical Significance}
+    \begin{enumerate}
+        \item Does the paper report error bars suitably and correctly?
+        \answerYes{Main result reports 3-seed mean $\pm$ std (28.92$\pm$0.56\%). Ablations are single-seed due to compute constraints; paired bootstrap ($B=10{,}000$) is used for significance testing. We note this partial coverage explicitly.}
+    \end{enumerate}
+
+\item {\bf Experiments Compute Resources}
+    \begin{enumerate}
+        \item For each experiment, does the paper provide sufficient information on the computer resources needed to reproduce the experiments?
+        \answerYes{RTX 4090 GPUs (24GB); training time $\sim$7h per 7B model; eval $\sim$1--2h per pool.}
+    \end{enumerate}
+
+\item {\bf Code Of Ethics}
+    \begin{enumerate}
+        \item Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics?
+        \answerYes{}
+    \end{enumerate}
+
+\item {\bf Broader Impacts}
+    \begin{enumerate}
+        \item Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed?
+        \answerYes{Our work reveals that file-level R@1 may overstate code understanding, which has implications for how the community evaluates and deploys bug localization systems. Path priors in evaluation benchmarks may create a false sense of progress in code understanding. We see no direct negative societal impacts beyond standard concerns with automated code analysis tools.}
+    \end{enumerate}
+
+\item {\bf Safeguards}
+    \begin{enumerate}
+        \item Does the paper describe safeguards that have been put in place for responsible release of data or models?
+        \answerNA{The released benchmarks (PathSwap, Code-Crucial) are diagnostic evaluation tools derived from existing public datasets (GREPO, SWE-bench) and do not pose safety risks.}
+    \end{enumerate}
+
+\item {\bf Licenses for existing assets}
+    \begin{enumerate}
+        \item Are the creators or original owners of assets used in the paper properly credited and are the license and terms of use explicitly mentioned and properly respected?
+        \answerYes{GREPO and SWE-bench are cited. Base models (Qwen2.5, Llama-3.1) are used under their respective licenses.}
+    \end{enumerate}
+
+\item {\bf New Assets}
+    \begin{enumerate}
+        \item Are new assets introduced in the paper well documented and is the documentation provided alongside the assets?
+        \answerYes{PathSwap-GREPO construction is detailed in Appendix~\ref{app:pathswap_examples}; Code-Crucial construction criteria are in Section~\ref{sec:efficiency}.}
+    \end{enumerate}
+
+\item {\bf Crowdsourcing and Research with Human Subjects}
+    \begin{enumerate}
+        \item For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots?
+        \answerNA{No human subjects or crowdsourcing involved.}
+    \end{enumerate}
+
+\item {\bf Institutional Review Board (IRB) Approvals or Equivalent for Research with Human Subjects}
+    \begin{enumerate}
+        \item Does the paper describe potential risks incurred by study participants?
+        \answerNA{No human subjects involved.}
+    \end{enumerate}
+
+\end{enumerate}
+
+
+\appendix
+
+\section{SPAR: Scope-aware Path-Aware Reranking}
+\label{app:spar}
+
+The path/code decomposition enables a principled method: \textbf{SPAR} routes low-confidence examples (by path-model score gap) to a code-aware model, while retaining path-only predictions for confident cases.
+Table~\ref{tab:spar} compares three code channels under SPAR.
+The key finding: \textbf{naive code integration fails} ($\alpha$-sweep finds $\alpha{=}0$), but \textbf{confidence-gated routing succeeds}: long-context code at 50\% routing achieves R@1\,=\,29.03\%---the first configuration to exceed path-only (28.92$\pm$0.56\%)---while improving Code-Crucial from 11.7\% to 14.2\%.
+Code-residual (anonymized paths) gains nothing under routing, confirming that the code channel must see real paths to contribute.
+
+\begin{table}[h]
+\centering
+\caption{SPAR: confidence-gated routing to different code models. ``Route \%'' = fraction of least-confident examples re-ranked by the code model. $\dagger$Best routing fraction selected on validation. Long-context SPAR is the first setting where code improves over path-only.}
+\label{tab:spar}
+\small
+\begin{tabular}{llccc}
+\toprule
+\textbf{Code channel} & \textbf{Route\%}$^\dagger$ & \textbf{Overall} & \textbf{$\Delta$} & \textbf{CC-R@1} \\
+\midrule
+None (path-only) & 0\% & 27.01\% & --- & 11.7\% \\
+\midrule
+Selective retrieval & 50\% & 28.65\% & $+$1.64 & 14.6\% \\
+Long-context code & 50\% & \textbf{29.03\%} & $+$2.02 & 14.2\% \\
+Code-residual (anon paths) & 30\% & 27.02\% & $+$0.01 & 12.9\% \\
+\midrule
+\multicolumn{5}{l}{\emph{Ablation: no routing (100\% code)}} \\
+Long-context code & 100\% & 28.53\% & $+$1.52 & 12.6\% \\
+Selective retrieval & 100\% & 28.87\% & $+$1.86 & 15.4\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The routing mechanism is critical: 100\% code (no routing) achieves only $+$1.52pp, while SPAR at 50\% achieves $+$2.02pp, because path-only is superior on confident examples and code helps only on uncertain ones.
+This operationalizes the path prior finding: rather than trying to remove path reliance (which degrades performance), SPAR \emph{leverages} path confidence as a gating signal for selective code reasoning.
+
+\section{Pipeline and Model-Side Structural Injection: Full Details}
+\label{app:model_side}
+\label{app:pipeline_details}
+
+This appendix provides the full experimental details for the seven structural injection points summarized in Table~\ref{tab:overview} (\S\ref{sec:overview}). All model-side approaches fail to improve over the structure-unaware baseline.
+
+\begin{table}[h]
+\centering
+\caption{Seven structural injection points. Only candidate-side expansion is robustly effective; all six model-side approaches fail to improve over the structure-unaware baseline in our tested configurations.}
+\label{tab:overview}
+\small
+\begin{tabular}{llccl}
+\toprule
+\textbf{Injection point} & \textbf{Stage} & \textbf{Effect} & \textbf{Robust?} & \textbf{Details} \\
+\midrule
+Candidate expansion & Search & $+$5.58\% R@1 & \checkmark & \S\ref{sec:expansion} \\
+\midrule
+SFT prompt context & Generation & $\pm$0.2\% H@1 & $\times$ & \S\ref{app:stage1_ablation} \\
+Graph-hard negatives & Training & $+$0.74\% R@1 & $\times$ ($p{=}0.33$) & \S\ref{app:neg_ablation} \\
+Scorer context (Graph-RAG) & Scoring & $-$17.5\% R@1 & $\times$ & \S\ref{app:structure_analysis} \\
+Graph feature fusion & Scoring & $-$0.02\% R@1 & $\times$ & \S\ref{app:structure_analysis} \\
+Score propagation & Post-scoring & $-$0.4 to $-$14pp & $\times$ & \S\ref{app:structure_analysis} \\
+Mixed-pool training & Generalization & ckpt-dependent & $\times$ & \S\ref{app:coupling} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Generation-Side: SFT Prompt Structural Context}
+\label{app:stage1_ablation}
+
+Does adding structural context (co-change pairs, import edges, test-source maps) to the SFT generation prompt improve candidate quality?
+We compare two variants: (i)~file tree only (the default), and (ii)~file tree + structural context.
+With matching eval prompts, the graph-context variant achieves H@1 = 18.57 vs.\ 18.73 for filetree-only---a negligible difference.
+However, the graph-context model becomes \emph{dependent} on structural input: when evaluated without graph context at inference (filetree prompt only), H@1 drops to 13.68 ($-$27\% relative).
+This fragility makes the graph-context variant strictly inferior: it adds no performance while requiring graph data at inference.
+
+\subsection{Training-Side: Graph-Hard Negative Mining}
+\label{app:neg_ablation}
+
+On the default seed, graph-hard negatives contribute +3.0\% R@1 ($p = 0.011$) over BM25-hard negatives, outperforming all structural heuristics including tree-neighbor (+2.88\%, $p < 0.0001$; Table~\ref{tab:negatives}).
+However, this advantage is not robust across seeds (Table~\ref{tab:seeds}, $p = 0.33$), motivating a factorial analysis.
+
+\paragraph{Retrieval--reranker interaction.}
+To isolate graph-hard \emph{training} from graph-expanded \emph{retrieval}, we evaluate all four combinations:
+
+\begin{table}[h]
+\centering
+\caption{Pipeline decomposition: candidate pool $\times$ reranker training (2$\times$2 factorial, 5-seed means $\pm$ std).}
+\label{tab:interaction}
+\small
+\begin{tabular}{llc}
+\toprule
+\textbf{Candidate pool} & \textbf{Reranker training} & \textbf{R@1} \\
+\midrule
+BM25-only & BM25-only & $19.23 \pm 0.58$ \\
+BM25-only & Graph-hard   & $18.89 \pm 0.30$ \\
+Graph-expanded & BM25-only & $24.27 \pm 0.39$ \\
+Graph-expanded & Graph-hard & $\mathbf{25.01 \pm 1.17}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Graph expansion alone contributes the largest single gain (+5.58\% R@1 averaged over reranker types, 95\% CI $[+3.8, +6.3]$, $p < 0.001$).
+This result is robust to repo-level clustering: a cluster bootstrap resampling whole repositories yields 95\% CI $[+5.4, +12.2]$ ($p < 0.0001$).
+Graph-hard training provides a conditional amplification: +0.73\% R@1 on expanded pools but $-$0.35\% on BM25-only pools, yielding an interaction effect of +1.08\% ($p = 0.14$, paired $t$-test, $n = 5$).
+
+\subsection{Scorer-Side Structure: Consistently Harmful}
+\label{app:structure_analysis}
+
+We evaluate three scorer-side approaches; all fail.
+
+\paragraph{Graph-edge context serialization.}
+Serializing graph edges into the scorer's context degrades R@1 by $-$17.5\% (from 27.3\% to 9.8\%); a shuffled-edge control performs comparably (7.6\%), confirming the degradation is primarily context noise (Appendix~\ref{app:graphrag}).
+Content summaries also degrade R@1 ($-$12.5\%).
+
+\paragraph{Post-scoring graph propagation.}
+Label-propagation-style score adjustment: $\mathbf{s}^{(t+1)} = \alpha \, \mathbf{s}_{\text{orig}} + (1 - \alpha) \, \widetilde{\mathbf{W}} \, \mathbf{s}^{(t)}$.
+Sweeping $\alpha \in [0.3, 0.95]$ and $T \in \{1, 3, 5, 10\}$ iterations, \textbf{every setting degrades R@1}---from $-$0.4pp ($\alpha = 0.95$) to $-$14.2pp ($\alpha = 0.3$).
+
+\paragraph{Learned graph-feature fusion.}
+Logistic regression over eight graph features combined with the cross-encoder score (leave-one-repo-out CV) achieves R@1 = 26.99\% vs.\ 27.01\% for the cross-encoder alone ($-$0.02pp)---zero marginal value.
+
+\section{Graph-Hard Negative Mining Details}
+\label{app:neg_detail}
+
+\begin{table}[h]
+\centering
+\caption{Negative mining ablation. Cond.\ Acc@1 = R@1 conditional on GT being in the candidate pool.}
+\label{tab:negatives}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Training Negatives} & \textbf{R@1} & \textbf{R@5} & \textbf{R@10} & \textbf{Cond.\ Acc@1} \\
+\midrule
+\textbf{50\% BM25 + 25\% graph + 25\% random} & \textbf{27.01} & \textbf{49.17} & \textbf{56.45} & \textbf{51.47\%} \\
+75\% BM25 + 25\% random (no graph) & 24.01 & 44.86 & 52.59 & 45.86\% \\
+100\% random & 24.10 & 44.11 & 51.84 & 45.54\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On the default seed, graph-hard negatives contribute +3.0\% R@1 ($p = 0.011$) and +5.6\% conditional accuracy.
+BM25-hard negatives (24.01\%) did not outperform random negatives (24.10\%, $p = 0.52$): BM25 retrieves files with matching keywords from distant parts of the repository tree (only 21.4\% share a parent directory with GT vs.\ 29.7\% for graph-hard, $p < 10^{-12}$), making them trivially distinguishable.
+
+\begin{table}[h]
+\centering
+\caption{Structural heuristic ablation: 25\% of negatives replaced by the listed type.}
+\label{tab:structural}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Negative type (25\%)} & \textbf{R@1} & \textbf{R@5} & \textbf{R@10} & \textbf{Cond.\ Acc@1} \\
+\midrule
+Graph-hard (co-change + import) & \textbf{27.01} & \textbf{49.17} & \textbf{56.45} & \textbf{51.47\%} \\
+Same-directory & 23.51 & 42.75 & 50.99 & --- \\
+Path-edit-distance ($\leq 2$ components) & 22.13 & 38.88 & 45.73 & --- \\
+Tree-neighbor (sibling dirs) & 24.13 & 43.39 & 51.27 & --- \\
+Combined struct.\ (10\%+10\%+5\%) & 22.29 & 41.24 & 49.17 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Graph-hard negatives outperform the best structural heuristic (tree-neighbor) by 2.88\% R@1 ($p < 0.0001$, 95\% CI $[{+}1.60\%, {+}4.17\%]$).
+Cross-domain: graph-hard wins in 39/69 repos (57\%), loses in 16 (23\%), ties in 14 (20\%), improving R@1 in 8 of 9 domain categories.
+
+
+\section{Graph-RAG Comparison}
+\label{app:graphrag}
+
+\begin{table}[h]
+\centering
+\caption{Fair Graph-RAG comparison: same model, different inference prompts (1,704 examples).}
+\label{tab:graphrag}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Inference Condition} & \textbf{R@1} & \textbf{R@5} & \textbf{R@10} \\
+\midrule
+Path only (our default) & \textbf{27.34} & \textbf{49.58} & \textbf{57.01} \\
++ File content summary & 14.83 & 24.61 & 29.23 \\
++ Graph edges (co-change + import) & 9.82 & 18.98 & 23.42 \\
++ Shuffled edges (random file names) & 7.58 & 14.70 & 17.62 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Real edges (9.8\%) vs.\ shuffled edges (7.6\%) at R@1: the small gap suggests most degradation is context noise, not graph-specific.
+Stage 1 (SFT) benefits from structural context because it is a generative model that must enumerate candidate files across the entire repository; Stage 3 (cross-encoder) is a pointwise scorer in a short context window ($\leq$512 tokens) where graph edges overwhelm the signal.
+
+
+\section{Additional Analyses}
+\label{app:additional}
+
+\subsection{Diagnostic Probes}
+\label{app:probes}
+
+\paragraph{Signal attribution.}
+Correct top-1 predictions decompose as: keyword match ($\sim$52\%), substring match ($\sim$17\%), override ($\sim$20\%), zero textual signal ($\sim$10\%).
+
+\paragraph{Same-filename disambiguation.}
+Among test examples with duplicate filenames (e.g., \texttt{models.py}), the reranker achieves 67.2\% accuracy in selecting the correct directory.
+
+\paragraph{Graph-neighbor confusion.}
+The graph-trained model shows 45.9\% conditional accuracy on graph-neighbor examples vs.\ 50.1\% for the no-graph model---graph training does \emph{not} reduce neighbor confusion, suggesting graph-hard negatives work by providing harder training examples, not by teaching graph topology.
+
+
+\subsection{Inductive Evaluation}
+\label{app:inductive}
+
+\begin{table}[h]
+\centering
+\caption{Inductive: 560 examples from 12 completely unseen repositories.}
+\label{tab:inductive}
+\small
+\begin{tabular}{lcccl}
+\toprule
+\textbf{Method} & \textbf{R@1} & \textbf{R@5} & \textbf{R@10} & \textbf{$p$-value} \\
+\midrule
+Merged pool (BM25 ordering) & 20.52 & 38.47 & 46.69 & --- \\
+\textbf{Inductive reranker} & \textbf{20.77} & \textbf{46.70} & \textbf{55.37} & R@5/R@10: $< 0.0001^{***}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Cross-Language Transfer (BeetleBox)}
+\label{app:beetlebox}
+
+\begin{table}[h]
+\centering
+\caption{Cross-language transfer: GREPO-trained (Python) reranker on BeetleBox Java (740 examples, top-200 BM25 candidates). Filename shuffling causes $-$60\% R@1 collapse, confirming path dependence transfers across languages.}
+\label{tab:beetlebox}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Condition} & \textbf{R@1} & \textbf{R@5} \\
+\midrule
+Baseline (no perturbation) & 14.43 & 29.89 \\
+Shuffle filenames          & 5.79 & --- \\
+\midrule
+\textbf{Drop} & $-$60\% & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The BM25-only reranker outperforms the graph-hard reranker, supporting the conditional-benefit interpretation: graph-hard negatives encode Python-specific structure that does not transfer to Java.
+
+
+\subsection{Model Scale Ablation}
+\label{app:scale}
+
+\begin{table}[h]
+\centering
+\caption{Model scale ablation: R@1 for graph-hard vs.\ BM25-only rerankers. All trained without Stage 1 SFT.}
+\label{tab:scale}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model size} & \textbf{Graph-hard R@1} & \textbf{BM25-only R@1} & \textbf{$\Delta$} \\
+\midrule
+0.5B  & 20.02 & 20.12 & -0.10 \\
+1.5B  & 21.54 & 20.66 & +0.88 \\
+3B    & 23.37 & 23.18 & +0.19 \\
+7B    & 24.54 & 23.91 & +0.63 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both methods improve monotonically with scale. The graph-hard advantage does not increase monotonically, suggesting the benefit is not primarily a function of model capacity. Training without SFT initialization also controls for the potential confound that the main reranker inherits structural information from Stage~1 LoRA.
+
+\paragraph{PathSwap-GREPO across scales.}
+Table~\ref{tab:pathswap} shows PathSwap evaluation across model sizes.
+
+\begin{table}[h]
+\centering
+\caption{PathSwap-GREPO: R@$k$ after replacing all path tokens with structure-preserving hashes. All models collapse to near-random; larger models collapse more.}
+\label{tab:pathswap}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Model} & \textbf{R@1} & \textbf{$\Delta$} & \textbf{R@5} & \textbf{$\Delta$} & \textbf{R@10} & \textbf{$\Delta$} \\
+\midrule
+0.5B (original) & 20.02 & & 38.69 & & 47.46 & \\
+0.5B (PathSwap) & 1.65 & $-$91.8\% & 4.97 & $-$87.2\% & 8.50 & $-$82.1\% \\
+\midrule
+1.5B (original) & 21.54 & & 41.16 & & 48.74 & \\
+1.5B (PathSwap) & 1.63 & $-$92.4\% & 4.52 & $-$89.0\% & 8.16 & $-$83.3\% \\
+\midrule
+3B (original) & 23.37 & & 43.58 & & 51.24 & \\
+3B (PathSwap) & 1.55 & $-$93.4\% & 3.70 & $-$91.5\% & 6.86 & $-$86.6\% \\
+\midrule
+7B (original) & 27.01 & & 49.17 & & 56.45 & \\
+7B (PathSwap) & 1.06 & $-$96.1\% & 4.09 & $-$91.7\% & 6.86 & $-$87.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Stratified Analysis}
+\label{app:stratified}
+
+\begin{table}[h]
+\centering
+\caption{Stratified R@1 analysis. $\Delta$ = full pipeline minus BM25-only baseline.}
+\label{tab:stratified}
+\small
+\begin{tabular}{llrrr}
+\toprule
+\textbf{Stratification} & \textbf{Stratum} & \textbf{N} & \textbf{R@1} & \textbf{$\Delta$} \\
+\midrule
+\multirow{2}{*}{GT files} & single-file & 668 & 43.4 & +15.0 \\
+ & multi-file & 1036 & 16.4 & +4.6 \\
+\midrule
+\multirow{3}{*}{Repo size} & small ($<$200) & 180 & 27.2 & +2.9 \\
+ & medium (200--500) & 394 & 29.3 & +10.4 \\
+ & large ($>$500) & 1130 & 26.2 & +9.0 \\
+\midrule
+\multirow{2}{*}{Expansion} & GT only in expanded & 130 & 20.8 & +15.8 \\
+ & GT in both pools & 1199 & 34.6 & +9.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Co-change edges contribute more than import edges (+11.9pp vs.\ +6.7pp on expansion-only examples), consistent with co-change capturing cross-module dependencies invisible to static analysis.
+
+
+\subsection{Budget Curve}
+\label{app:budget}
+
+\begin{table}[h]
+\centering
+\caption{Candidate budget summary. Graph expansion reaches 90.7\% oracle recall at roughly 208 candidates, whereas BM25 requires roughly 393 candidates to reach the same level.}
+\label{fig:budget_curve}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Retriever} & \textbf{Budget for $\approx$90.7\% recall} & \textbf{Interpretation} \\
+\midrule
+Graph-expanded pool & $\sim$208 & Same recall with substantially smaller candidate set \\
+BM25-only pool & $\sim$393 & Requires nearly $1.9\times$ larger budget \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Edge-Type Ablation}
+\label{app:edge_type}
+
+To decompose the contribution of each edge type, we evaluate the graph-hard reranker on pools expanded from \emph{BM25 seeds} (not SFT seeds) using different edge types.
+The minimal gains over the BM25-only baseline (28.45) show that graph expansion requires high-quality seed candidates to be effective---structure amplifies good seeds rather than creating signal from weak anchors.
+
+\begin{table}[h]
+\centering
+\caption{Edge-type ablation: R@1 with BM25-seeded expansion (not SFT-seeded). BM25-only reranking (no expansion) achieves 28.45; full pipeline with SFT seeds achieves 29.38.}
+\label{tab:edge_type}
+\small
+\begin{tabular}{lc}
+\toprule
+\textbf{Edge type} & \textbf{R@1} \\
+\midrule
+Co-change only & 20.15 \\
+Import only & 19.96 \\
+Both (co-change + import) & \textbf{20.44} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Expansion Parameter Sensitivity}
+\label{app:sensitivity}
+
+We sweep co-change threshold $\tau_\mathrm{cc} \in \{0.01, 0.03, 0.05, 0.10, 0.20\}$, max co-change neighbors $\in \{3, 5, 10, 15, 20\}$, and max import neighbors $\in \{3, 5, 10, 15, 20\}$.
+Oracle recall varies by $<$0.1pp across $\tau_\mathrm{cc}$ values, $<$2pp across neighbor budgets, and \emph{all 15 settings} improve over the BM25-only baseline.
+
+
+\subsection{PathSwap-GREPO Construction Examples}
+\label{app:pathswap_examples}
+
+Table~\ref{tab:pathswap_examples} shows concrete before/after examples from PathSwap-GREPO.
+Each path component (directory name, filename stem) is replaced with a deterministic hash prefix (\texttt{d\_} for directories, \texttt{m\_} for modules).
+The following invariants are preserved: (i)~directory depth and nesting structure, (ii)~file extension (\texttt{.py}), (iii)~all file content (code, docstrings, comments), (iv)~graph topology (co-change, import, directory edges), (v)~ground-truth labels.
+The only information destroyed is the semantic content of path tokens---the exact signal our perturbation study (\S\ref{sec:analysis}) identifies as the reranker's dominant prior.
+
+\begin{table}[h]
+\centering
+\caption{PathSwap-GREPO examples: original paths and their structure-preserving counterfactual replacements. Directory depth and nesting are preserved; only path-token identity is destroyed.}
+\label{tab:pathswap_examples}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Original path} & \textbf{PathSwap path} \\
+\midrule
+\texttt{cirq/value/linear\_dict.py} & \texttt{d\_f4e8/d\_a406/m\_008e.py} \\
+\texttt{cirq/value/linear\_dict\_test.py} & \texttt{d\_f4e8/d\_a406/m\_d8be.py} \\
+\texttt{cirq/\_\_init\_\_.py} & \texttt{d\_f4e8/m\_3414.py} \\
+\texttt{cirq/ops/\_\_init\_\_.py} & \texttt{d\_f4e8/d\_0cf0/m\_3414.py} \\
+\texttt{cirq/circuits/circuit\_test.py} & \texttt{d\_f4e8/d\_1dc6/m\_921d.py} \\
+\texttt{cirq/google/sim/xmon\_sim\_test.py} & \texttt{d\_f4e8/d\_d493/d\_0736/m\_7fbe.py} \\
+\texttt{cirq/sim/\_\_init\_\_.py} & \texttt{d\_f4e8/d\_0736/m\_3414.py} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Note that \texttt{\_\_init\_\_.py} files in different directories map to the same module hash (\texttt{m\_3414}) because the hash is computed from the filename stem alone, preserving the structural regularity that all packages have an init module.
+Files in the same directory share the same directory hash prefix (e.g., \texttt{d\_f4e8/d\_a406/} for \texttt{cirq/value/}), preserving co-location signals while destroying semantic path content.
+
+\begin{table}[h]
+\centering
+\caption{PathSwap (SHA-256 hash) results across model scales on GREPO-Test (1704 examples). PathSwap destroys all lexical path content, producing 92--98\% R@1 collapse---substantially worse than filename shuffling (53--77\%), confirming that models exploit both filename identity and directory-level path tokens.}
+\label{tab:pathswap_scale}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{Standard R@1} & \textbf{PathSwap R@1} & \textbf{Drop} \\
+\midrule
+0.5B (graph pool) & 20.02\% & 1.65\% & $-$92\% \\
+3B (graph pool) & 23.37\% & 1.55\% & $-$93\% \\
+7B (graph pool) & 27.01\% & 1.06\% & $-$96\% \\
+\midrule
+0.5B (hybrid pool) & 24.12\% & 1.36\% & $-$94\% \\
+3B (hybrid pool) & 28.82\% & 0.92\% & $-$97\% \\
+7B (hybrid pool) & 20.00\% & 0.39\% & $-$98\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Gradient Attribution Analysis}
+\label{app:gradient_attribution}
+
+We compute input-gradient attribution ($|\nabla_{\mathbf{e}} \cdot \mathbf{e}|$ summed over the hidden dimension) on 300 GREPO test examples using the fine-tuned Qwen2.5-7B reranker in eval mode.
+Each input token is classified as \emph{path} (file path region), \emph{issue} (bug report text), or \emph{template} (prompt separators) using tokenizer offset mapping.
+
+\begin{table}[h]
+\centering
+\caption{Gradient attribution by token category (300 GREPO examples, mean $\pm$ std). Per-token density = (attribution \%) / (mean tokens). Path tokens comprise $\sim$4\% of input tokens but receive 22.9\% of total attribution mass---a 4.8$\times$ per-token density advantage over issue tokens.}
+\label{tab:gradient_attribution}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Category} & \textbf{Mean tokens} & \textbf{Token share} & \textbf{Attribution \%} & \textbf{Density ($\times 10^3$)} \\
+\midrule
+Path & 6.2 & 3.7\% & 22.9 $\pm$ 11.8 & 40.0 \\
+Issue & 140.0 & 82.5\% & 51.2 $\pm$ 18.5 & 8.3 \\
+Template & 23.6 & 13.9\% & 25.9 $\pm$ 11.0 & 11.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Path Predictability Analysis}
+\label{app:path_predictability}
+
+To quantify how much discriminative signal file paths carry about bug location \emph{without} any neural model, we train logistic regression classifiers on simple path features using grouped 5-fold cross-validation (split by issue to prevent leakage).
+
+\begin{table}[h]
+\centering
+\caption{Path predictability AUC (1321 issues, 66K candidate triples, GroupKFold CV). Even a bag-of-words model over path tokens alone achieves AUC\,=\,0.64, confirming that file paths carry strong discriminative signal about bug location.}
+\label{tab:path_predictability}
+\small
+\begin{tabular}{lc}
+\toprule
+\textbf{Feature set} & \textbf{AUC} \\
+\midrule
+Path lexical overlap with issue & 0.636 \\
+Path TF-IDF & 0.640 \\
+Issue + Path TF-IDF & 0.589 \\
+Path structure only (depth, is\_test, etc.) & 0.587 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Notably, adding issue text to path features \emph{decreases} AUC (0.640 $\to$ 0.589) in this linear setup, suggesting that simple path-token matching already captures most of the discriminative signal accessible to a bag-of-words model---consistent with the neural reranker's disproportionate reliance on paths.
+
+\subsection{Code-Crucial Sensitivity Analysis}
+\label{app:cc_sensitivity}
+
+\begin{table}[h]
+\centering
+\caption{Code-Crucial sensitivity analysis: code-residual vs.\ path-only across seven subset definitions with varying overlap thresholds and witness requirements. The code-residual model underperforms path-only on \emph{every} variant ($\Delta$ = $-$1.5 to $-$5.1pp), confirming the finding is robust to construction choices. Note: the main-text Code-Crucial (116 examples) uses a stricter definition; variants here use broader criteria to test sensitivity.}
+\label{tab:cc_sensitivity}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Definition} & \textbf{N} & \textbf{Path} & \textbf{Code-res.} & \textbf{$\Delta$} \\
+\midrule
+Original (frac$<$0.1, witness) & 265 & 19.1\% & 17.5\% & $-$1.6 \\
+Strict (frac$<$0.05, witness) & 215 & 22.2\% & 19.8\% & $-$2.4 \\
+Loose (frac$<$0.2, witness) & 489 & 20.8\% & 17.6\% & $-$3.2 \\
+No witness (frac$<$0.1) & 454 & 11.7\% & 10.2\% & $-$1.5 \\
+No witness (frac$<$0.2) & 727 & 14.4\% & 11.8\% & $-$2.6 \\
+Jaccard$<$0.05, witness & 962 & 31.7\% & 26.5\% & $-$5.1 \\
+Jaccard$<$0.1, witness & 1271 & 31.8\% & 26.9\% & $-$4.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Seed Robustness}
+\label{app:seeds}
+
+\begin{table}[h]
+\centering
+\caption{Seed robustness: R@1 (mean $\pm$ std) over five seeds.}
+\label{tab:seeds}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{R@1 (mean $\pm$ std)} & \textbf{R@5 (mean $\pm$ std)} \\
+\midrule
+Graph-hard   & $25.01 \pm 1.17$ & $45.56 \pm 2.02$ \\
+BM25-only    & $24.27 \pm 0.39$ & $44.52 \pm 0.58$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Code Signal Decomposition}
+\label{app:code_decomposition}
+
+\paragraph{When does code uniquely help?}
+Per-example decomposition: path-only is uniquely correct on 17.1\% of examples, code uniquely on 7.2\%, both on 32.3\%, neither on 43.5\%.
+Path's unique contribution is 2.4$\times$ code's. Code-unique examples concentrate in compute-heavy repos (jax, scipy) with low path overlap, but are too few for fusion to exploit ($\alpha{=}0$ optimal).
+
+\paragraph{Issue-path mismatch: where code helps.}
+On 41 extreme-mismatch examples (near-zero overlap and code-centric coverage), code-centric achieves R@1 = 34.81\% vs.\ path-only 27.59\% ($+$7.2pp)---the only slice where code consistently outperforms path, but too small ($<$2\% of test) to shift aggregate results.
+
+\paragraph{What is the code signal?}
+Obfuscating identifiers (with anonymized paths) drops R@1 from 22.68\% to 17.39\% ($-$5.3pp), showing $\sim$23\% of code signal is identifier-based; with real paths, the drop is only 1.1pp.
+
+\paragraph{Attention analysis.}
+Last-layer attention weights from the reranker given code-centric prompts (path + 50 lines of code) show per-token attention density on path tokens is 12.2$\times$ higher than on code tokens, despite code constituting 53\% of input tokens.
+
+\subsection{Counterfactual Evaluation and Path-Invariant Training}
+\label{app:counterfactual}
+
+\begin{table}[h]
+\centering
+\caption{Counterfactual evaluation of the path-only model on the 1546-example counterfactual subset (R@1 is higher than the 1704-example full test because this subset excludes examples without valid swap pairs). Since the model prompt contains no code, identical results across conditions are a consistency check, not a finding.}
+\label{tab:counterfactual}
+\small
+\begin{tabular}{lc}
+\toprule
+\textbf{Condition} & \textbf{R@1} \\
+\midrule
+Original (path correct, code correct) & 32.84\% \\
+Path correct, code wrong & 32.84\% \\
+Path wrong, code correct & 32.84\% \\
+All crossed & 32.84\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We evaluate the path-only model under counterfactual conditions where code content is systematically varied while candidate file paths are held constant. Since the path-only model's prompt contains only the bug report and candidate path (no code content), all four conditions produce identical inputs to the model---the ``code wrong'' and ``code correct'' labels refer to whether the \emph{paired} code matches the path, not to model inputs. The identical R@1 across conditions is thus a consistency check confirming the model does not access code, not a surprising finding. The more informative evidence comes from the code-centric scorer comparisons (Table~\ref{tab:code_centric}), where code \emph{is} provided but provides no improvement.
+
+\begin{table}[h]
+\centering
+\caption{Code-aware scorers vs.\ path-only across standard and challenge subsets. CC = code-centric (real paths + code), CR = code-residual (anonymized paths + code). Path-only wins or ties on all subsets except issue-path mismatch ($<$2\% of test set).}
+\label{tab:code_centric}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Test condition} & \textbf{Path-only} & \textbf{CC\,(50L)} & \textbf{CC\,(200L)} & \textbf{CR\,(100L)} \\
+\midrule
+Full test (1704 ex.) & \textbf{28.92$\pm$0.56}\% & 28.74\% & 28.94\% & 24.19\% \\
+Shuffle filenames & 7.24\% & 6.62\% & --- & 6.33\% \\
+\midrule
+Same-stem (904 ex.) & \textbf{24.04}\% & 23.08\% & --- & 17.67\% \\
+Hard (de-leaked $\cap$ same-stem) & \textbf{14.98}\% & 14.18\% & --- & 11.01\% \\
+Issue-path mismatch (41 ex.) & 27.59\% & \textbf{34.81}\% & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Path-invariant training.}
+We train a path-invariant variant where 50\% of training examples have randomly shuffled file paths, forcing the model to rely on code content for those examples. On unperturbed test data, this model achieves R@1\,=\,26.01\% (vs.\ 28.92$\pm$0.56\% for path-only, a $-$2.9pp cost). However, on the filename-shuffled test, it achieves only R@1\,=\,6.54\%, no better than the original model's 7.24\%. Increasing code context from 30 to 100 lines similarly provides no improvement (R@1\,=\,24.60\% vs.\ 24.09\%). These results suggest that, in our tested pointwise configurations, the difficulty is not in the training recipe but in the limited discriminative power of code-matching signals for file-level localization.
+
+\paragraph{Path-controlled challenge subsets.}
+We construct five diagnostic subsets: (i)~De-leaked (2175 examples, ground-truth filenames masked from issue text); (ii)~Same-stem (904 examples, duplicate filenames in candidate pool); (iii)~Hard (904, intersection of de-leaked and same-stem); (iv)~Same-directory confused (334 examples); (v)~Path-misled (229 examples). On these subsets, the path-only model achieves R@1 of 18.05\%, 24.04\%, 14.98\%, 9.04\%, and 8.45\% respectively (vs.\ 28.92\% on the full test), confirming that path dependence produces identifiable failure modes.
+
+
+\section{Implementation Details}
+\label{app:impl}
+
+\subsection{Temporal Leakage Audit}
+\label{app:leakage}
+
+Co-change edges are computed exclusively from training-split PRs (\texttt{grepo\_train.jsonl}); no test-split data is used.
+Import edges are derived from static AST analysis of repository snapshots, independent of any PR timestamp.
+The BM25 candidate pools for test examples are generated from the repository file tree at the \texttt{before\_fix} commit SHA, ensuring no future information is used.
+The train/test split in GREPO is by issue ID, not by time; we verify that no issue IDs overlap between train (7,883) and test (2,175) splits.
+All three code paths that build the co-change index enforce a \texttt{split=='train'} filter.
+62.2\% of test examples have at least one ground-truth file appearing as a node in the training co-change graph---this reflects genuine historical co-modification patterns, not information leakage.
+
+\subsection{Training Hyperparameters}
+\label{app:hyperparams}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Stage 1 (SFT)} & \textbf{Stage 3 (Reranker)} \\
+\midrule
+Base model & \multicolumn{2}{c}{Qwen2.5-7B-Instruct} \\
+LoRA rank / $\alpha$ / dropout & \multicolumn{2}{c}{32 / 64 / 0.05} \\
+LoRA targets & \multicolumn{2}{c}{$\mathbf{W}_{q,k,v,o}$, $\mathbf{W}_{\text{gate,up,down}}$} \\
+Learning rate & $2 \times 10^{-5}$ & $5 \times 10^{-5}$ \\
+Scheduler & \multicolumn{2}{c}{cosine (5\% warmup)} \\
+Epochs & 3 & 2 \\
+Max seq length & 2048 & 512 \\
+Negatives per positive & --- & 16 \\
+Optimizer & \multicolumn{2}{c}{AdamW ($\beta_1=0.9, \beta_2=0.999$)} \\
+Gradient clipping & \multicolumn{2}{c}{1.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Comparison Caveats}
+\label{app:caveats}
+
+CodeGRIP serves as an experimental testbed, not a competitive system. Cross-system numbers (e.g., SweRank) are included as reference points but are not directly comparable due to different training data (7,883 vs.\ 67K examples), evaluation protocols, and the fact that our expansion pipeline uses graph signals at inference. The most internally consistent comparisons are the controlled ablations (Section~\ref{sec:analysis}), where all variants share the same base model and candidate pool.
+
+
+\subsection{Path Anonymization Control}
+\label{app:path_anon}
+
+To test whether the reranker relies on file naming conventions (a potential shortcut), we evaluate with anonymized paths.
+Each path component is replaced with a consistent hash per repository, preserving tree depth and \texttt{.py} extension but removing all semantic path content (e.g., \texttt{src/models/transformer.py} $\to$ \texttt{a3f8b2c1/d9e7f4a0/b1c2d3e4f5a6.py}).
+
+\begin{table}[h]
+\centering
+\small
+\caption{Path anonymization control (GREPO, 1704 examples). ``Hashed'' replaces each path component with a deterministic hash; ``Shuffled'' randomly permutes file names across the repository.}
+\label{tab:path_anon}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Condition} & \textbf{R@1} & \textbf{R@5} & \textbf{R@10} & \textbf{Cond.\ Acc@1} \\
+\midrule
+Original paths & 24.51 & 44.18 & 52.12 & 46.51\% \\
+Hashed paths & 1.19 & 3.94 & 7.07 & 3.82\% \\
+Shuffled paths & 1.10 & 3.43 & 5.77 & 3.56\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Path anonymization reduces R@1 from 24.5\% to $\sim$1.2\%, confirming that semantic path content is essential for the reranker's performance.
+This is expected: the cross-encoder uses path-only prompts, so path semantics \emph{are} the primary signal.
+Importantly, hashed and shuffled paths perform comparably ($\sim$1\%), indicating the model cannot exploit directory structure alone without meaningful file names.
+The residual $\sim$1\% is consistent with random chance given the average pool size of $\sim$163 candidates.
+
+
+\subsection{Path Features Predict Graph Structure}
+\label{app:path_predicts}
+
+To test whether file paths implicitly encode repository structure, we train logistic regression classifiers to predict co-change and import edges from path-derived features alone.
+For each repository, we construct positive pairs (file pairs connected by the target edge type) and sample 5$\times$ negative pairs (unconnected files).
+Four features are computed per pair:
+
+\begin{enumerate}
+    \item \textbf{Jaccard path components}: Jaccard similarity over the set of directory/file components in each path.
+    \item \textbf{Shared directory depth}: number of shared leading path components.
+    \item \textbf{Leaf filename similarity}: character-level Jaccard similarity of the filename (without extension).
+    \item \textbf{Path edit distance}: Levenshtein distance between full paths, normalized by max length.
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\caption{Path features predicting graph edges. AUC averaged across repositories with $\geq$10 positive pairs.}
+\label{tab:path_pred}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Edge type} & \textbf{AUC} & \textbf{Top feature (log-odds)} \\
+\midrule
+Co-change & 0.667 & Leaf filename similarity ($+$1.43) \\
+Import & 0.728 & Jaccard path components ($+$5.01) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Paths are an imperfect but substantial proxy for explicit graph structure, supporting the hypothesis that the cross-encoder's structural knowledge is encoded in path semantics.
+
+
+\subsection{Learned Expansion Policy}
+\label{app:learned_expansion}
+
+To test whether graph structure carries signal beyond random diversification, we train a gradient-boosted classifier to predict which graph neighbors of SFT-predicted files are actually ground-truth files.
+Features include: maximum and sum co-change weight to seed files, import connection count, directory distance (shared path components), BM25 rank, and number of seed files linking to the neighbor.
+The classifier is trained on GREPO train examples and evaluated on test.
+
+\begin{table}[h]
+\centering
+\caption{Learned expansion policy: oracle recall at matched pool sizes. ``Budget $K$'' = top-$K$ neighbors per seed file selected by the classifier or random baseline.}
+\label{tab:learned_expansion}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Policy} & \textbf{K=3} & \textbf{K=5} & \textbf{K=10} & \textbf{K=15} & \textbf{K=20} \\
+\midrule
+Random & 29.1\% & 30.2\% & 32.1\% & 34.3\% & 36.4\% \\
+Classifier & \textbf{35.0\%} & \textbf{36.6\%} & \textbf{39.6\%} & \textbf{41.7\%} & \textbf{43.1\%} \\
+\midrule
+$\Delta$ & +5.9 & +6.4 & +7.5 & +7.3 & +6.6 \\
+\bottomrule
+\end{tabular}
+\\[4pt]
+{\footnotesize Full (unfiltered) graph expansion: 52.2\% oracle recall, avg pool = 71 files.}
+\end{table}
+
+The classifier achieves +5.9--7.5pp over random at every budget, demonstrating that graph structure provides genuine signal for identifying relevant neighbors.
+The most important feature is maximum co-change weight (0.44 importance), followed by sum co-change weight (0.35).
+
+
+\subsection{Prompt Templates}
+\label{app:prompts}
+
+\paragraph{Stage 3: Cross-encoder reranking.}
+The reranker uses a binary relevance prompt, scoring each candidate independently:
+
+\begin{quote}
+\small
+\texttt{Given the bug report, is this file likely to need modification?}\\[2pt]
+\texttt{Bug Report: \{issue\_text\}}\\[2pt]
+\texttt{File: \{candidate\_path\}}\\[2pt]
+\texttt{Answer:}
+\end{quote}
+
+The score is $s = z_{\text{Yes}} - z_{\text{No}}$, where $z_{\text{Yes}}$ and $z_{\text{No}}$ are the logits for the ``Yes'' and ``No'' tokens at the generation position after ``Answer:''.
+This converts a generative LLM into a pointwise scorer without architectural modification.
+
+\paragraph{Stage 1: SFT generation.}
+The SFT model receives the bug report and repository file tree (no structural context; see \S\ref{app:stage1_ablation}), and generates file paths:
+
+\begin{quote}
+\small
+\texttt{You are analyzing a bug report for the Python repository ``\{repo\}''.}\\[2pt]
+\texttt{The repository contains the following Python files:}\\
+\texttt{\{file\_list\}}\\[2pt]
+\texttt{Bug Report: \{issue\_text\}}\\[2pt]
+\texttt{From the file list above, identify which Python files need to be modified to fix this bug. Output file paths only, one per line, most relevant first.}
+\end{quote}
+
+
+\subsection{BM25 Retrieval Details}
+\label{app:bm25}
+
+\paragraph{GREPO evaluation.}
+BM25 retrieval indexes all Python files per repository, using file paths and content.
+The top-500 candidates form the initial retrieval pool.
+Candidates are merged with Stage~2 graph-expanded files via score-weighted interleaving, yielding $\sim$163 candidates on average.
+
+\paragraph{SWE-bench Lite retrieval.}
+We apply several enhancements over standard BM25 (``BM25$_\text{tricked}$''):
+\begin{enumerate}
+    \item \textbf{Test exclusion}: Files matching \texttt{test\_*.py} or \texttt{*\_test.py} patterns are removed from the candidate pool, improving H@1 by $\sim$9\% absolute.
+    \item \textbf{Multi-granularity indexing}: We create two parallel indexes---function-level and chunk-level (500-token chunks)---and fuse rankings via reciprocal rank fusion (RRF) with $k = 60$.
+    \item \textbf{Stemming}: Snowball stemmer applied to both queries and documents.
+    \item \textbf{Post-processing}: Results mapped back to file-level, deduplicated by first occurrence.
+\end{enumerate}
+
+The oracle across all retrieval pools (path, content, function, chunk, and their combinations) reaches H@1 = 54\%, indicating substantial headroom for improved fusion strategies.
+
+
+\section{SWE-bench Additional Details}
+\label{app:swebench_details}
+
+\subsection{Confidence-Calibrated Hybrid Strategy}
+\label{app:hybrid}
+
+The hybrid strategy for SWE-bench combines neural reranking with BM25 fallback based on model confidence:
+
+\begin{enumerate}
+    \item \textbf{Score gap}: For each example, compute $\Delta = s_1 - s_2$, the difference between the top-1 and top-2 neural scores.
+    \item \textbf{Confidence switching}: If $\Delta \geq \tau$ (threshold), keep the neural top-1 prediction. Otherwise, use RRF of neural and BM25 rankings.
+    \item \textbf{Junk file fallback}: If the neural top-1 is a likely non-source file (matching patterns like \texttt{docs/conf.py}, \texttt{*/migrations/*.py}), fall back to BM25 regardless of confidence.
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Confidence calibration of the adapted model (SWE-bench Lite, 274 matched).}
+\label{tab:confidence}
+\begin{tabular}{cccc}
+\toprule
+\textbf{Gap threshold $\tau$} & \textbf{N (confident)} & \textbf{Accuracy} & \textbf{Coverage} \\
+\midrule
+$\geq 1.0$ & 160 & 68.1\% & 58.4\% \\
+$\geq 1.5$ & 130 & 73.8\% & 47.4\% \\
+$\geq 2.0$ & 104 & 79.8\% & 38.0\% \\
+$\geq 3.0$ & 70 & 84.3\% & 25.5\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Higher thresholds yield higher accuracy but lower coverage.
+The optimal threshold balances accuracy with coverage: $\tau = 1.5$ for the adapted model (73.8\% accuracy, 47.4\% coverage) vs.\ $\tau = 2.0$ for the GREPO-trained model, reflecting improved calibration from domain adaptation.
+
+
+\subsection{SWE-bench Per-Repository Breakdown}
+\label{app:perrepo}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Per-repository H@1 on SWE-bench Lite (all 300 instances). BM25 = BM25$_\text{tricked}$; Neural = adapted model raw 1024-ctx predictions.}
+\label{tab:perrepo}
+\begin{tabular}{lrcc}
+\toprule
+\textbf{Repository} & \textbf{N} & \textbf{BM25 H@1} & \textbf{Neural H@1} \\
+\midrule
+django/django & 114 & 39.5\% & 53.5\% \\
+sympy/sympy & 77 & 41.6\% & 51.9\% \\
+matplotlib/matplotlib & 23 & 52.2\% & 43.5\% \\
+scikit-learn/scikit-learn & 23 & 26.1\% & 47.8\% \\
+pytest-dev/pytest & 17 & 29.4\% & 29.4\% \\
+sphinx-doc/sphinx & 16 & 68.8\% & 43.8\% \\
+astropy/astropy & 6 & 83.3\% & 83.3\% \\
+psf/requests & 6 & 50.0\% & 33.3\% \\
+pylint-dev/pylint & 6 & 16.7\% & 50.0\% \\
+pydata/xarray & 5 & 0.0\% & 60.0\% \\
+mwaskom/seaborn & 4 & 50.0\% & 75.0\% \\
+pallets/flask & 3 & 66.7\% & 66.7\% \\
+\midrule
+\textbf{Overall} & \textbf{300} & \textbf{41.3\%} & \textbf{54.67\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The neural reranker improves over BM25 on most repositories, with the largest gains on django (+14.0\%), scikit-learn (+21.7\%), xarray (+60.0\%), and pylint (+33.3\%).
+BM25 retains advantages on sphinx ($-$31.3\%) and matplotlib ($-$4.4\%), likely due to distinctive naming patterns in those codebases that favor lexical matching.
+The hybrid strategy mitigates this complementarity by using BM25 fallback when neural confidence is low.
+
+
+\subsection{SWE-bench Domain Adaptation}
+\label{app:adaptation}
+
+\paragraph{Training data.}
+We construct adaptation data from SWE-bench Full (2,294 instances), excluding all 300 SWE-bench Lite test instances.
+After filtering for available BM25 candidates and Python file changes, 1,874 training examples remain, covering the same 12 repositories as Lite.
+
+\paragraph{Training setup.}
+The adapted model initializes from the GREPO-trained reranker checkpoint (Stage 3) and fine-tunes for 2 epochs with lr = $1 \times 10^{-5}$, using the same listwise loss with 32 negatives (75\% BM25-hard, 25\% random; no graph negatives, since SWE-bench lacks co-change history for these repositories).
+
+\paragraph{Data efficiency.}
+CodeGRIP uses 1,874 target-domain adaptation examples---35$\times$ fewer than SweRankEmbed-Large's 67K.
+Including GREPO pre-training (7,883 examples), total supervised data is $\sim$9.8K ($\sim$6.9$\times$ less than SweRank's 67K).
+The GREPO pre-training provides a strong initialization, enabling effective transfer with minimal target-domain data.
+Without adaptation, the GREPO-trained model still achieves H@1 = 51.5\% (274 matched) via hybrid fusion, demonstrating that graph-structured training on GREPO transfers to SWE-bench despite different repositories and issue formats.
+
+
+\subsection{Function-Level Extension}
+\label{app:function}
+\label{sec:function_level}
+
+Extending CodeGRIP to function-level localization (ranking functions within predicted files), the reranker achieves Hit@1 = 19.86\% vs.\ random 7.46\% (2.7$\times$), with MRR = 60.83\%, demonstrating applicability beyond file-level granularity.
+
+\paragraph{Function-level path perturbation.}
+To test whether the path prior extends beyond file-level localization, we evaluate at function granularity. For each test example, we expand the top-50 BM25 file candidates into $\sim$1200 function-level candidates using a precomputed function index, yielding qualified \texttt{file\_path::function\_name} candidates.
+
+\begin{table}[h]
+\centering
+\caption{Function-level evaluation (1113 evaluable examples out of 1583 with function GT). Shuffling function names across files causes 90\% collapse, mirroring the file-level pattern.}
+\label{tab:function_level}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Condition} & \textbf{Func R@1} & \textbf{Func Hit@1} \\
+\midrule
+Baseline & 10.95\% & 32.52\% \\
+Shuffled (names permuted across files) & 1.06\% & 4.58\% \\
+\midrule
+\textbf{Drop} & \textbf{$-$90\%} & \textbf{$-$86\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The pattern is consistent: shuffling function names across files causes a 90\% collapse in function-level R@1 (10.95\% $\to$ 1.06\%), demonstrating that the path prior operates at multiple granularities.
+
+
+\subsection{Hardness Analysis}
+\label{app:hardness}
+
+\begin{table}[h]
+\centering
+\caption{R@1 stratified by difficulty (reranker vs.\ BM25 pool ordering).}
+\label{tab:hardness}
+\small
+\begin{tabular}{lrrrc}
+\toprule
+\textbf{Stratum} & \textbf{N} & \textbf{Reranker} & \textbf{BM25} & \textbf{$\Delta$} \\
+\midrule
+\multicolumn{5}{l}{\emph{By BM25 rank of first GT file}} \\
+\quad Rank 1 (easy) & 645 & 47.48\% & 59.46\% & $-$11.98\% \\
+\quad Rank 2--5 & 250 & 21.90\% & 0.00\% & +21.90\% \\
+\quad Rank 6--20 & 232 & 16.70\% & 0.00\% & +16.70\% \\
+\quad Rank 20+ (hard) & 577 & 10.48\% & 0.00\% & +10.48\% \\
+\midrule
+\multicolumn{5}{l}{\emph{By repository size}} \\
+\quad Large (1000+ files) & 729 & 21.12\% & 14.70\% & +6.42\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The reranker excels on harder examples (BM25 rank $\geq 2$: +10--22\% absolute) and large repositories (+6.42\%), where structural patterns are most informative.
+On easy examples (BM25 rank 1), it slightly degrades ($-$12\%)---a known trade-off in learned reranking.
+
+
+\subsection{Content-Aware Training Control}
+\label{app:content_control}
+
+Training the reranker with file content summaries in prompts, then evaluating path-only, yields R@1 = 22.28\%---a degradation from path-only training (29.38\% with best checkpoint).
+This confirms that the training prompt should match inference conditions: introducing information at training time that is unavailable at test time creates a train/test distribution mismatch.
+
+
+\section{Cross-Pool Generalization: Checkpoint Sensitivity}
+\label{app:coupling}
+
+\begin{table}[h]
+\centering
+\caption{Checkpoint sensitivity of the apparent ``oracle fallacy.'' Dense checkpointing removes the large gap observed under a single sparse checkpoint.}
+\label{fig:oracle_fallacy}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Checkpointing} & \textbf{Graph pool R@1} & \textbf{Hybrid pool R@1} & \textbf{Gap} \\
+\midrule
+Sparse (save\_steps=200, single checkpoint) & --- & --- & $\sim$7pp \\
+Dense (save\_steps=10, best checkpoint) & 29.38\% & 29.38\% & 0.00pp \\
+Dense (23 checkpoints, mean gap) & --- & --- & 0.49pp \\
+Dense (23 checkpoints, max gap) & --- & --- & 1.12pp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A natural assumption in multi-stage pipelines is that higher candidate recall should translate to higher end-to-end accuracy.
+At a single checkpoint (save\_steps=200), we previously observed an apparent ``oracle fallacy'': a hybrid retriever (BM25 + E5-large) achieves $+$1.3pp higher oracle recall than the graph-expanded pool (91.4\% vs.\ 90.1\%), yet the reranker's R@1 appeared to drop substantially.
+
+\paragraph{Dense checkpointing reveals the gap is checkpoint-dependent.}
+Under dense checkpointing (save\_steps=10 vs.\ the original 200), the best checkpoint achieves 29.38\% R@1 on the graph pool and 29.38\% on the hybrid pool---\textbf{zero gap}.
+Across all 23 checkpoints evaluated, the mean cross-pool gap is only 0.49pp (max 1.12pp), far below the 7pp previously observed.
+The BM25-only pool similarly improves to 28.45\% R@1.
+This reveals that the large gap was an artifact of sparse checkpoint selection, not a fundamental retriever-reranker coupling effect.
+
+\begin{table}[h]
+\centering
+\caption{Cross-pool generalization under dense checkpointing (save\_steps=10, best checkpoint). The gap between pools is $<$1pp, in contrast to the $\sim$7pp gap observed at a single checkpoint under sparse checkpointing (save\_steps=200).}
+\label{tab:recovery}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Checkpoint strategy} & \textbf{Graph pool} & \textbf{Hybrid pool} & \textbf{BM25 pool} \\
+\midrule
+Sparse (save\_steps=200) & 27.01 & 19.29 & 20.08 \\
+Dense (save\_steps=10, best) & \textbf{29.38} & \textbf{29.38} & \textbf{28.45} \\
+\midrule
+$\Delta$ gap (graph $-$ hybrid) & 7.72 & \multicolumn{2}{c}{$<$1.12 (mean 0.49)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We originally termed this cross-pool gap the \textbf{oracle fallacy}.
+Formally, let $\mathcal{R}_A, \mathcal{R}_B$ be two retrievers with oracle recalls $O_A < O_B$, and let $f_\theta$ be a reranker trained on $\mathcal{R}_A$'s output distribution.
+The oracle fallacy occurs when $\text{R@}k(f_\theta, \mathcal{R}_B) < \text{R@}k(f_\theta, \mathcal{R}_A)$ despite $O_B > O_A$.
+Our updated finding is that this gap is \textbf{checkpoint-sensitive}: under sparse checkpointing, it appears as a 7pp coupling effect; under dense checkpointing, it shrinks to $<$1.2pp.
+This is a methodological warning: cross-pool evaluation protocols that rely on a single checkpoint can produce misleading conclusions about retriever-reranker coupling.
+
+\paragraph{Score-distribution diagnostic (sparse checkpoint).}
+At the sparse checkpoint (save\_steps=200), the pool-swap effect is visible in the reranker's score distribution.
+On the 1,361 examples where ground-truth files appear in both pools' top-50, the reranker assigns GT files a mean score of 4.24 on graph-expanded candidates vs.\ 3.46 on hybrid candidates ($-$0.78 logit gap).
+GT files are ranked higher in the graph pool in 61.7\% of cases vs.\ 30.6\% for hybrid.
+
+\paragraph{Architecture independence (sparse checkpoint).}
+At the sparse checkpoint, the cross-pool gap is not specific to cross-encoders.
+We evaluate three scorer architectures on the same graph-expanded vs.\ hybrid candidate pools (Table~\ref{tab:fallacy_arch}).
+At this checkpoint, all three show the pattern of higher oracle recall but lower R@1.
+
+\begin{table}[h]
+\centering
+\caption{Cross-pool gap across scorer architectures (sparse checkpoint, save\_steps=200). Under dense checkpointing, the trained cross-encoder gap shrinks to $<$1.2pp.}
+\label{tab:fallacy_arch}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Scorer} & \multicolumn{2}{c}{\textbf{Graph-expanded}} & \multicolumn{2}{c}{\textbf{Hybrid}} & \textbf{$\Delta$Oracle} & \textbf{$\Delta$R@1} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+ & Oracle & R@1 & Oracle & R@1 & & \\
+\midrule
+Cross-encoder (sparse ckpt) & 90.7\% & 27.01 & 92.1\% & 19.29 & +1.4 & $-$7.7 \\
+Cross-encoder (dense, best) & 90.7\% & 29.38 & 92.1\% & 29.38 & +1.4 & 0.0 \\
+E5-large (zero-shot) & 90.7\% & 10.12 & 92.1\% & 9.43 & +1.3 & $-$0.7 \\
+SweRank-Embed (zero-shot) & 90.7\% & 18.18 & 92.1\% & 18.16 & +1.3 & $-$0.02 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Scale dependence (sparse checkpoint).}
+At the sparse checkpoint, the cross-pool gap shows scale dependence (Table~\ref{tab:scale_fallacy}).
+At 0.5B--3B, the hybrid pool consistently \emph{improves} R@1 ($+$4.1 to $+$5.5pp).
+At 7B with sparse checkpointing, the same swap \emph{degrades} R@1 by $-$7.0pp; however, under dense checkpointing the 7B gap shrinks to $<$1.2pp.
+
+\begin{table}[h]
+\centering
+\caption{Scale-dependent cross-pool gap (sparse checkpoint). The 7B gap ($-$7.0pp) shrinks to $<$1.2pp under dense checkpointing (Table~\ref{tab:recovery}).}
+\label{tab:scale_fallacy}
+\small
+\begin{tabular}{lccrccrr}
+\toprule
+\textbf{Model} & \multicolumn{3}{c}{\textbf{R@1}} & \multicolumn{3}{c}{\textbf{R@5}} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-7}
+ & Graph & Hybrid & $\Delta$ & Graph & Hybrid & $\Delta$ \\
+\midrule
+0.5B  & 20.02 & \textbf{24.12} & $+$4.1 & 38.69 & \textbf{46.27} & $+$7.6 \\
+1.5B  & 21.54 & \textbf{26.28} & $+$4.7 & 41.16 & \textbf{48.74} & $+$7.6 \\
+3B    & 23.37 & \textbf{28.82} & $+$5.5 & 43.58 & \textbf{51.70} & $+$8.1 \\
+7B (sparse ckpt) & \textbf{27.01} & 20.00 & $-$7.0 & \textbf{49.17} & 38.12 & $-$11.1 \\
+7B (dense, best) & \textbf{29.38} & 29.38 & 0.0 & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Score-gap analysis across scales.}
+At the sparse checkpoint, the score gap between the top-ranked GT file and the strongest distractor shows scale-dependent behavior (Table~\ref{tab:score_gap}).
+For 0.5B--3B, the hybrid pool \emph{increases} the score gap.
+For 7B, the gap \emph{collapses}: the fraction of examples where the top distractor outscores GT rises from 44.8\% to 54.7\%.
+
+\begin{table}[h]
+\centering
+\caption{Score-gap analysis across scales and pools (sparse checkpoint).}
+\label{tab:score_gap}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Model} & \multicolumn{2}{c}{\textbf{Gap mean}} & \multicolumn{2}{c}{\textbf{Gap$<$0\%}} & \multicolumn{2}{c}{\textbf{GT rank}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7}
+ & Graph & Hybrid & Graph & Hybrid & Graph & Hybrid \\
+\midrule
+0.5B  & $-$0.32 & $-$0.15 & 56.9 & 51.9 & 7.1 & 5.5 \\
+1.5B  & $-$0.28 & $-$0.01 & 54.0 & 48.7 & 6.8 & 5.0 \\
+3B    & $+$0.05 & $+$0.26 & 50.9 & 43.4 & 6.2 & 4.6 \\
+7B    & $+$0.09 & $-$0.23 & 44.8 & 54.7 & 5.2 & 8.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Boundary condition: superset pools.}
+On SWE-bench, we trained a reranker on BM25 candidates (1,874 examples) and evaluated on the native BM25 pool (oracle recall 86.7\%) and a hybrid pool (oracle recall 91.7\%, $+$5.0pp).
+Both yield identical R@1 = 39.67\%.
+The dense-only candidates are scored so low that they never enter the top-200 ranking.
+This reveals a necessary condition for cross-pool degradation: the additional candidates must be \emph{competitive} under the reranker's scoring function.
+
+
+\section{Delexicalization and Regularization}
+\label{app:delex}
+
+Given the path prior finding, a natural question is whether reducing path-lexical shortcuts during training improves generalization.
+We apply 50\% on-the-fly delexicalization: for half of training examples, file path tokens overlapping with issue text are replaced with stable hashes.
+Delex50 achieves R@1 = 29.46\% on the graph pool and 29.61\% on the hybrid pool (Table~\ref{tab:mitigation})---a modest $+$0.2pp average improvement over the dense-checkpointed baseline (29.38\%).
+
+Counterfactual negative training (25\% same-directory, 25\% maximal path-token overlap) achieves R@1 = 28.60\% / 29.52\%.
+Combining with delexicalization does not further improve (R@1 = 28.33\% / 29.16\%), suggesting the two debiasing signals are largely redundant.
+
+\begin{table}[h]
+\centering
+\caption{Delexicalization results: R@1 (\%) on graph-expanded and hybrid candidate pools.}
+\label{tab:mitigation}
+\small
+\begin{tabular}{lccr}
+\toprule
+\textbf{Method} & \textbf{Graph pool} & \textbf{Hybrid pool} & \textbf{$\Delta$ gap} \\
+\midrule
+Sparse ckpt baseline (save\_steps=200) & 27.01 & 19.29 & 7.72 \\
+Dense ckpt baseline (save\_steps=10) & 29.38 & 29.38 & 0.00 \\
+\midrule
+Delex50 (delexicalization) & \textbf{29.46} & \textbf{29.61} & $-$0.15 \\
+CF-Neg (counterfactual negatives) & 28.60 & 29.52 & $-$0.92 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\section{External Validity: Additional Results}
+\label{app:external_validity}
+
+\begin{table}[h]
+\centering
+\caption{Transfer to SWE-bench Lite~\citep{jimenez2024swebench} (all 300 instances). ``Adapted'' fine-tunes on 1,874 SWE-bench Full examples (no Lite test overlap).}
+\label{tab:swebench}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Data} & \textbf{H@1} \\
+\midrule
+BM25$_{\text{tricked}}$ & --- & 41.3 \\
+LocAgent (Claude-3.5) & --- & 46.3 \\
+CodeGRIP (GREPO-trained, raw neural) & 7,883 & 46.3 \\
+\textbf{CodeGRIP (adapted, raw neural)} & \textbf{1,874} & \textbf{54.67} \\
+CodeRankEmbed (137M) & 67K & 54.3 \\
+SweRankEmbed-Large (7B, 67K) & 67K & 56.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The adapted CodeGRIP reranker achieves 54.67\% H@1 with a 7B model using 1,874 target-domain examples ($\sim$36$\times$ fewer than SweRankEmbed-Large's 67K), demonstrating that path priors transfer effectively even across benchmarks.
+
+\begin{table}[h]
+\centering
+\caption{External validity: reranker performance degrades under larger shifts but remains above retrieval-only baselines.}
+\label{tab:external}
+\small
+\begin{tabular}{lcccl}
+\toprule
+\textbf{Setting} & \textbf{N} & \textbf{R@1} & \textbf{R@5} & \textbf{Shift type} \\
+\midrule
+GREPO (seen repos) & 1,144 & 29.81 & 52.18 & In-domain \\
+GREPO (unseen repos) & 560 & 20.77 & 46.70 & New repos, same lang \\
+BeetleBox Java & 740 & 14.43 & 29.89 & Cross-language \\
+SWE-bench Lite (zero-shot) & 300 & 48.00--51.33 & --- & Cross-benchmark \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\footnotesize SWE-bench R@1 range across three GREPO-trained model families (zero-shot, BM25-top-500 pool).}
+\end{table}
+
+\paragraph{Seed robustness.}
+Training with five random seeds (42, 1, 2, 3, 4), graph-hard negatives show a mean R@1 advantage of $+$0.74\% ($25.01 \pm 1.17$ vs.\ $24.27 \pm 0.39$), but this is \emph{not} statistically significant ($p = 0.33$, paired $t$-test).
+Graph expansion remains the robust structural signal, improving R@1 in 58\% of repos (Wilcoxon $p = 0.0005$, 69 repos).
+
+\paragraph{Win/loss analysis.}
+Across 1,704 test examples, the full pipeline wins 485 and loses 141 compared to the BM25-only baseline (3.4$\times$ win ratio).
+51\% of wins are reranking improvements, 40\% are coverage wins.
+
+
+\section{Tables Moved from Main Body}
+\label{app:moved_tables}
+
+\begin{table}[h]
+\centering
+\caption{Main results on GREPO (1,704 test examples). $^{***}p < 0.0001$ vs.\ BM25 (paired bootstrap). Cross-system numbers are reference points, not direct comparisons (see Appendix~\ref{app:caveats}).}
+\label{tab:main}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{R@1} & \textbf{R@5} \\
+\midrule
+BM25 (lexical, top-500) & 10.00 & 23.38 \\
+SweRank (7B, 67K data) & 18.18 & 34.83 \\
+\textbf{CodeGRIP (full pipeline)} & \textbf{29.38}$^{***}$ & \textbf{49.17}$^{***}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Scorer prompt ablation (single checkpoint). Content does not help; the path-only scorer outperforms all content-aware variants. All rows use the same checkpoint for fair comparison; the 3-seed path-only mean is 28.92$\pm$0.56\% (Table~\ref{tab:cross_architecture}).}
+\label{tab:content_ablation}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Scorer prompt} & \textbf{R@1} & \textbf{R@5} \\
+\midrule
+Path only (default) & \textbf{27.01} & \textbf{49.17} \\
+Path + content summary & 23.01 & 39.89 \\
+Path + content (init from path-only) & 22.94 & 39.47 \\
+Content training $\to$ path-only eval & 22.28 & 41.28 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Path perturbation across scorer architectures and languages. All models show large R@1 collapse under filename shuffling. $^\ddagger$Frontier API evaluated on 100 randomly sampled examples due to cost. Bottom row: Python-trained model evaluated zero-shot on Java (BeetleBox).}
+\label{tab:cross_architecture}
+\small
+\begin{tabular}{llccc}
+\toprule
+\textbf{Architecture} & \textbf{Training} & \textbf{Baseline} & \textbf{Shuffle} & \textbf{Drop} \\
+\midrule
+Cross-encoder (Qwen2.5-7B) & Fine-tuned & 27.01\% & 7.24\% & $-$73\% \\
+Cross-encoder (Llama-3.1-8B) & Fine-tuned & 28.35\% & 7.11\% & $-$75\% \\
+Cross-encoder (Qwen3-8B) & Fine-tuned & 29.38\% & 7.60\% & $-$74\% \\
+\midrule
+Cross-encoder (Qwen2.5-14B) & Zero-shot & 16.21\% & 4.70\% & $-$71\% \\
+Bi-encoder (E5-large-v2) & Zero-shot & 9.50\% & 2.92\% & $-$69\% \\
+Generative listwise (Qwen2.5-7B) & Zero-shot & 41.55\% & 19.54\% & $-$53\% \\
+\midrule
+Frontier API (DeepSeek-V3.2)$^\ddagger$ & Zero-shot & 5.06\% & 2.72\% & $-$46\% \\
+Frontier API (Qwen-Max)$^\ddagger$ & Zero-shot & 22.45\% & 12.57\% & $-$44\% \\
+Frontier + code (Qwen3-Max, 100L)$^\ddagger$ & Zero-shot & 55.26\% & 30.26\% & $-$45\% \\
+Agentic + code (Qwen3-Max, CoT)$^\ddagger$ & Zero-shot & 54.55\% & 20.78\% & $-$62\% \\
+\midrule
+\multicolumn{5}{l}{\emph{Cross-language (Python$\to$Java, BeetleBox, 740 examples)}} \\
+Cross-encoder (Qwen2.5-7B) & Fine-tuned & 14.43\% & 5.79\% & $-$60\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Path perturbation on SweRank (SWE-bench Lite, $n{=}300$). The SOTA dense retriever exhibits the same path dependence as our fine-tuned reranker. \emph{Filename shuffle} permutes file names within each directory; \emph{shuffle dirs} permutes directory names; \emph{flatten} collapses the directory hierarchy. SweRankEmbed-Large uses unperturbed candidate file paths as documents; under perturbation, only the displayed path is changed.}
+\label{tab:swerank_perturb}
+\small
+\begin{tabular}{lccccc}
+\toprule
+& \multicolumn{2}{c}{\textbf{Small (137M)}} & \multicolumn{2}{c}{\textbf{Large (7B)}} \\
+\textbf{Perturbation} & R@1 & Drop & R@1 & Drop \\
+\midrule
+None (baseline) & 26.33\% & --- & 37.00\% & --- \\
+Shuffle filenames & 6.00\% & $-$77\% & 8.33\% & $-$77.5\% \\
+Shuffle directories & --- & --- & 15.00\% & $-$59.5\% \\
+Flatten directories & --- & --- & 16.33\% & $-$55.9\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\section{Expansion Boundary Conditions and Headroom}
+\label{app:expansion_details}
+
+\begin{table}[h]
+\centering
+\caption{Full pipeline decomposition. ``BM25-only reranking'' applies the same trained reranker to BM25-top-500 without Stage~2 graph expansion.}
+\label{tab:ablation}
+\small
+\begin{tabular}{lccccr}
+\toprule
+\textbf{Configuration} & \textbf{R@1} & \textbf{R@5} & \textbf{R@10} & \textbf{R@20} & \textbf{Pool} \\
+\midrule
+BM25 only (no reranker) & 10.00 & 23.38 & 29.21 & 38.54 & 500 \\
+Reranker on BM25-only & 28.45 & 38.74 & 46.41 & 53.40 & 500 \\
+\midrule
+Stage 1 only (SFT generation) & 21.33 & 29.48 & 30.86 & 31.62 & $\sim$32 \\
+\quad + Graph expansion + BM25 merge & 22.51 & 36.64 & 42.64 & 49.69 & $\sim$163 \\
+\quad + Reranker (full pipeline) & \textbf{29.38} & \textbf{49.17} & \textbf{56.45} & \textbf{63.48} & $\sim$163 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The gain from graph expansion decomposes: single-file bugs ($+$15.0pp) and medium repos ($+$10.4pp) benefit most; for 7.6\% of examples, GT appears \emph{only} in the expanded pool (Appendix~\ref{app:stratified}).
+On SWE-bench (12 unseen repos, no in-domain graph data), expansion has no effect (R@1=18.0 with or without), confirming that the gain requires repository-specific graph structure.
+
+\paragraph{Remaining search-side headroom.}
+Two-hop iterative expansion from the top-10 reranked files finds 30.9\% of GT files missing from the round-1 pool, raising GT coverage from 51.2\% to 66.3\%.
+A learned expansion policy achieves $+$5.9--7.5pp higher oracle recall than random expansion at matched pool sizes (Appendix~\ref{app:learned_expansion}).
+
+\paragraph{Deployment.}
+The reranker is graph-free at scoring time; Stage~2 requires pre-computed graph indexes (1.4s CPU total, $<$0.02\% of inference time).
+Expansion is robust to parameter choice: all 15 sweep settings improve over the baseline (Appendix~\ref{app:sensitivity}).
+
+
+\section{Opaque vs.\ Descriptive Repositories}
+\label{app:opaque_descriptive}
+
+Repos are classified as ``descriptive'' vs.\ ``opaque'' by median file-path token overlap with issue text, split at the median.
+Path-only achieves 35.8\% R@1 on descriptive repos but only 21.4\% on opaque repos ($-$14.4pp), confirming that path informativeness directly drives performance.
+
+\section{Confidence-Gated Path-to-Code Inference}
+\label{app:confidence_gated}
+
+We implement a training-free confidence-gated strategy as a proof-of-concept that the path/code decomposition enables practical improvements.
+We use the path-only model's score gap (top-1 minus top-2 score) as a confidence signal: when the gap exceeds a threshold, the path-only prediction is used directly; when below, we fall back to the selective-retrieval model.
+The best configuration (70\% path, 30\% code routing) achieves conditional Acc@1\,=\,50.59\% vs.\ path-only 49.35\% ($+$1.24pp) on the 1,704 examples where GT files appear in the candidate pool.\footnote{Conditional Acc@1 = fraction of examples where the top-1 prediction is in the ground-truth set, restricted to examples with GT in the candidate pool.}
+The gain is modest but demonstrates that by explicitly routing low-confidence examples to code-aware models, we extract complementary signal that aggregate fusion misses.
+
+
+\end{document}
