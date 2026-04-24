@@ -113,9 +113,19 @@ On BM25 top-100 file pool (partial R@1):
 | Model | Lite | Lite PathSwap | Δ_rel | Verified | Verified PathSwap | Δ_rel |
 |---|---|---|---|---|---|---|
 | 14B codeaware (aug=0.5) | **60.33** | **53.67** | **-11.0%** | **48.93** | **46.67** | **-4.6%** |
+| &nbsp;&nbsp;+ body-cleanfull§ | 56.67 | 53.33 | **-5.9%** | TODO | TODO | TODO |
 | 14B path-only (aug=0.0) | 56.33 | 39.33 | -30.2% | 48.62 | 34.18 | -29.7% |
 | 7B Run 2 (combined+aug) | 56.67 | 47.33 | -16.5% | 48.13 | 45.02 | -6.5% |
 | SweRankLLM-Small (7B, same pool) | 47.93 | — | — | — | — | — |
+
+§ body-cleanfull: the 50-line code snippet has repo-package tokens (astropy/django/sympy/…, 16 total) replaced by consistent hashes, isolating true path effect from body content mismatching the hashed path.
+
+## TODO (pending experiments)
+
+- [ ] **File-level cleanfull on SWE-bench Verified** (body-leakage-controlled Δ% on n=500). Lite done: Δ_rel refines from $-$11.0% to $-$5.9% after cleaning. Script: [`scripts/eval_codeaware_4bit_cleanfull.py`](scripts/eval_codeaware_4bit_cleanfull.py).
+- [ ] **Outline-prompt variant of codeaware**: replace first-50-lines with AST-rendered class/def signatures + decorators + first docstring line. Script ready: [`scripts/eval_codeaware_4bit_outline.py`](scripts/eval_codeaware_4bit_outline.py). Quick eval first; if ≥ 60.33 Lite R@1 then train new LoRA with outline prompt.
+- [ ] **SweRank native-pipeline reproduction**: current retriever file-level Acc@100 is 37.23% vs ≥78.10% expected; root cause not localized within budget. Documented as paper limitation §codeaware:swerank_repro.
+- [ ] **Significance for function-level cleanfull**: n=274 + current Δ=$-$14% is not statistically significant (McNemar p=0.44). Need Verified function pool to get n~500 — blocked on SweRank retriever reproduction above.
 
 ## License
 
