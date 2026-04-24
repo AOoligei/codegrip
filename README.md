@@ -120,12 +120,32 @@ On BM25 top-100 file pool (partial R@1):
 
 § body-cleanfull: the 50-line code snippet has repo-package tokens (astropy/django/sympy/…, 16 total) replaced by consistent hashes, isolating true path effect from body content mismatching the hashed path.
 
-## TODO (pending experiments)
+## Progress log (2026-04-24)
 
-- [ ] **File-level cleanfull on SWE-bench Verified** (body-leakage-controlled Δ% on n=500). Lite done: Δ_rel refines from $-$11.0% to $-$5.9% after cleaning. Script: [`scripts/eval_codeaware_4bit_cleanfull.py`](scripts/eval_codeaware_4bit_cleanfull.py).
-- [ ] **Outline-prompt variant of codeaware**: replace first-50-lines with AST-rendered class/def signatures + decorators + first docstring line. Script ready: [`scripts/eval_codeaware_4bit_outline.py`](scripts/eval_codeaware_4bit_outline.py). Quick eval first; if ≥ 60.33 Lite R@1 then train new LoRA with outline prompt.
-- [ ] **SweRank native-pipeline reproduction**: current retriever file-level Acc@100 is 37.23% vs ≥78.10% expected; root cause not localized within budget. Documented as paper limitation §codeaware:swerank_repro.
-- [ ] **Significance for function-level cleanfull**: n=274 + current Δ=$-$14% is not statistically significant (McNemar p=0.44). Need Verified function pool to get n~500 — blocked on SweRank retriever reproduction above.
+Work since the collaborator suggested replacing first-N-lines with AST outline:
+
+- Trained and evaluated two 14B QLoRA rerankers (Qwen2.5-14B) with same Run 2 recipe/data, changing only aug fraction: 14B aug=0.5 reaches Lite 60.33 / Verified 48.93, PathSwap Δ_rel $-$11.0% / $-$4.6%; same-base 14B aug=0 collapses $-$30.2% / $-$29.7% — so scale alone does not fix path shortcuts.
+- Ran the full SweRank native pipeline (Embed-Large + LLM-Small) under our SHA-256 PathSwap: 20.8% → 21.17% (no collapse). Documented, with the caveat that our absolute reproduction of the paper's 78.10% is 57pp off and the root cause could not be localized within budget.
+- Ran a body-cleanfull control for file-level eval (hash 16 repo-package tokens in the 50-line code snippet): Lite Δ_rel refines from $-$11.0% to $-$5.9% once incidental body/path token mismatches are removed.
+- Ran a 5-step function-level cleaning progression on the SweRank function pool (n=274, our function-level Codeaware LoRA): normal 19.34 → 17.88 → 16.79 → 16.60 → 15.69; monotonic trend, none of the pairwise differences is statistically significant (McNemar $p>0.25$). Placed in the appendix as diagnostic with a strong caveat because it sits on top of the unreproduced SweRank pipeline.
+- Paper rewriting with three chained codex reviews (5/10 → 6/10 → 7/10) plus one cold review (6/10), followed by ~15 independent cold-start codex proofread rounds fixing numerical, cross-reference, unit (pp vs %), and terminology issues throughout the draft. Added a main-result figure summarizing the 6-bar / 2-benchmark comparison.
+
+Scripts added this week:
+
+- [`scripts/eval_codeaware_4bit_cleanfull.py`](scripts/eval_codeaware_4bit_cleanfull.py): file-level eval with repo-package token hashing in the code snippet.
+- [`scripts/eval_codeaware_4bit_outline.py`](scripts/eval_codeaware_4bit_outline.py): file-level eval with AST outline replacing first-N-lines (not yet run end-to-end; collaborator is running this track).
+- [`scripts/cleanlite_build_subset.py`](scripts/cleanlite_build_subset.py): import / docstring / module-path cleaner for function-level corpus.
+
+## TODO
+
+Experiments we have not yet run but that would strengthen the paper:
+
+- **Single-knob 2×2 ablation** (fixed data + fixed base model, vary only `aug` ∈ {0, 0.5} and `code-in-prompt` ∈ {no, yes}, 3 seeds each). Currently Run 1 vs Codeaware toggles both knobs simultaneously, so we present the comparison as a recipe rather than isolating either knob. Cost ~15-30 GPU-hours.
+- **3-seed error bars for 14B Codeaware headline rows**. At n=300 / n=500 single-seed, the 0.31pp Verified gain of 14B Codeaware over 14B no-aug is within seed noise.
+- **File-level body-cleanfull on SWE-bench Verified**. Lite refines Δ_rel from $-$11.0% to $-$5.9%; Verified is left as a TODO (script ready, just needs a GPU pass).
+- **Function-level cleaning progression with larger n**. Currently n=274 is too small for significance; blocked on resolving the SweRank retriever reproduction issue above, or on re-running function-level eval on a wider pool.
+- **SweRank native-pipeline reproduction**. We obtain 20.8% strict file Acc@1 vs the paper's 78.10% under the official scripts and paper-pinned environment, a 57pp gap we could not localize. Ruled out: sequence-length truncation, obvious cmdline divergence, prefix/tokenizer mismatch. Likely remaining candidates: model-revision / checkpoint-weights specifics, or a subtle eval-protocol difference we haven't identified.
+- **Outline-based codeaware** (collaborator track). Replace the 50-line first-N snippet with a compact AST outline (class / def signatures, decorators, first-docstring-line). Quick: apply to the current 14B Codeaware LoRA at inference time and check whether Lite R@1 holds. If it does (and especially if Δ_rel under PathSwap tightens), train a new LoRA with outline prompt.
 
 ## License
 
